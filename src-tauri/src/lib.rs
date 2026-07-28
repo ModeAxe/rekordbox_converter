@@ -5,19 +5,46 @@
 
 mod sidecar;
 
-/// Returns the version line of the bundled FFmpeg sidecar, e.g.
-/// `ffmpeg version 7.1-essentials_build-www.gyan.dev ...`.
-///
-/// Used by the UI at startup to prove the sidecar is bundled and runnable.
+use rbusb_core::pdb::{inspect_export, ExportInspect};
+use rbusb_core::scanner::{self, ExportScan};
+use rbusb_core::usb::{self, DriveInfo};
+
 #[tauri::command]
 fn ffmpeg_version() -> Result<String, String> {
     sidecar::ffmpeg_version_line().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn list_drives() -> Vec<DriveInfo> {
+    usb::list_candidate_drives()
+}
+
+#[tauri::command]
+fn scan_drive(root: String) -> Result<ExportScan, String> {
+    scanner::scan_export(root).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn format_estimate(seconds: u32) -> String {
+    scanner::format_duration(seconds)
+}
+
+/// Reads export.pdb, exportExt.pdb and ANLZ PPTH tags; returns structured inspect data.
+#[tauri::command]
+fn inspect_drive(root: String) -> Result<ExportInspect, String> {
+    inspect_export(root).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![ffmpeg_version])
+        .invoke_handler(tauri::generate_handler![
+            ffmpeg_version,
+            list_drives,
+            scan_drive,
+            format_estimate,
+            inspect_drive
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

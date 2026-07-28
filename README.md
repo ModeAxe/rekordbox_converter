@@ -13,8 +13,8 @@ The app is being built in phases, each validated manually on real hardware
 before the next begins:
 
 - [x] Phase 0 — Scaffold (Tauri app, core crate, FFmpeg sidecar)
-- [ ] Phase 1 — USB detection and export scan (read-only)
-- [ ] Phase 2 — Pioneer database reading and round-trip proof
+- [x] Phase 1 — USB detection and export scan (read-only)
+- [x] Phase 2 — Pioneer database reading and round-trip proof
 - [ ] Phase 3 — FLAC→MP3 conversion engine and cache
 - [ ] Phase 4 — Database and ANLZ rewriting (on a copy)
 - [ ] Phase 5 — Full transactional pipeline on the USB
@@ -58,4 +58,4 @@ npm run tauri build
 - Pioneer DeviceSQL export format: <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html>
 - ANLZ analysis files: <https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/anlz.html>
 - Candidate parser libraries: [rekordcrate](https://github.com/Holzhaus/rekordcrate),
-  [rekordbox-pdb](https://crates.io/crates/rekordbox-pdb)
+  [rekordbox-pdb](https://crates.io/crates/rekordbox-pdb) (vendored with patches in `vendor/rekordbox-pdb/`)

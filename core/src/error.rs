@@ -17,4 +17,12 @@ pub enum Error {
     /// The selected drive is not a valid Rekordbox export.
     #[error("not a Rekordbox export: {0}")]
     NotARekordboxExport(String),
+
+    /// A path argument was missing or unusable.
+    #[error("{0}")]
+    Message(String),
+
+    /// Pioneer database parse failure.
+    #[error("database error: {0}")]
+    Database(String),
 }

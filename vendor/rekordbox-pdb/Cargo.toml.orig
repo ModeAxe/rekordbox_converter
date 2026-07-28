@@ -1,0 +1,18 @@
+[package]
+name = "rekordbox-pdb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.73"
+description = "Read and write the rekordbox export.pdb / exportExt.pdb databases from PIONEER USB exports"
+license = "MIT"
+repository = "https://github.com/fragmede/rekordbox-pdb-rs"
+keywords = ["rekordbox", "pioneer", "cdj", "dj", "devicesql"]
+categories = ["parser-implementations", "multimedia::audio"]
+
+[lib]
+name = "rekordbox_pdb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rekordbox-pdb"
+path = "src/main.rs"
