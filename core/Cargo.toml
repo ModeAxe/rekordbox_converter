@@ -1,0 +1,14 @@
+# rbusb-core: pure business logic for the Rekordbox USB FLAC->MP3 converter.
+# This crate must NOT depend on Tauri or any UI framework, so it stays
+# independently testable and reusable (e.g. for a future CLI).
+[package]
+name = "rbusb-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core engine: USB detection, Rekordbox export scanning, PDB/ANLZ rewriting, FFmpeg conversion, cache and pipeline orchestration"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }

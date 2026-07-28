@@ -1,0 +1,107 @@
+:root {
+  color-scheme: dark;
+  --bg: #101216;
+  --panel: #191c22;
+  --border: #2a2f38;
+  --text: #e6e9ee;
+  --muted: #8b93a1;
+  --accent: #3fa9f5;
+  --ok: #3ecf6e;
+  --error: #f2555a;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  user-select: none;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+  min-height: 100vh;
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+}
+
+.header h1 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+.version {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.card h2 {
+  margin: 0 0 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.status-row {
+  display: flex;
+  gap: 12px;
+  padding: 6px 0;
+  align-items: baseline;
+}
+
+.status-label {
+  width: 70px;
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.status-value {
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-value.ok {
+  color: var(--ok);
+}
+
+.status-value.error {
+  color: var(--error);
+  white-space: normal;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.footer {
+  margin-top: auto;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-align: center;
+}
