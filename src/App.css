@@ -160,6 +160,12 @@ body {
   cursor: not-allowed;
 }
 
+.staged-btn {
+  margin-top: 8px;
+  background: #2d8a5c;
+  color: #061810;
+}
+
 .secondary-btn {
   width: 100%;
   margin-top: 8px;
@@ -234,6 +240,36 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   user-select: text;
+}
+
+.progress-bar {
+  height: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.15s ease-out;
+}
+
+.progress-label {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.progress-file {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .hint {

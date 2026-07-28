@@ -15,8 +15,8 @@ before the next begins:
 - [x] Phase 0 — Scaffold (Tauri app, core crate, FFmpeg sidecar)
 - [x] Phase 1 — USB detection and export scan (read-only)
 - [x] Phase 2 — Pioneer database reading and round-trip proof
-- [ ] Phase 3 — FLAC→MP3 conversion engine and cache
-- [ ] Phase 4 — Database and ANLZ rewriting (on a copy)
+- [x] Phase 3 — FLAC→MP3 conversion engine and cache
+- [x] Phase 4 — Database and ANLZ rewriting (on a copy)
 - [ ] Phase 5 — Full transactional pipeline on the USB
 - [ ] Phase 6 — Settings, tests, polish
 

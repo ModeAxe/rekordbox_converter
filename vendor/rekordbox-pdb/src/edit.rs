@@ -33,6 +33,7 @@ fn field_spec(field: &str) -> Option<(usize, usize)> {
         "duration" => (0x54, 2),
         "color_id" => (0x58, 1),
         "rating" => (0x59, 1),
+        "file_type" => (0x5a, 2),
         _ => return None,
     })
 }
@@ -731,5 +732,123 @@ impl PdbEditor {
         row.extend_from_slice(&playlist_id.to_le_bytes());
         self.append_row(TableType::PlaylistEntries as u32, &row, 12, None)?;
         Ok(())
+    }
+
+    /// Updates a track's on-disk audio identity for a FLAC→MP3 conversion.
+    ///
+    /// Patches `bitrate`, `file_size`, and `file_type` in place, then rewrites
+    /// the filename (string slot 19) and file_path (slot 20) DeviceSQL strings
+    /// in place within the existing row allocation. Track id is unchanged.
+    ///
+    /// Returns an error if the new strings do not fit in the current allocation
+    /// (unexpected for a `.flac` → `.mp3` shrink, but possible for other renames).
+    pub fn update_track_audio(
+        &mut self,
+        track_id: u32,
+        new_file_path: &str,
+        new_filename: &str,
+        bitrate: u32,
+        file_size: u32,
+    ) -> Result<()> {
+        self.set_track_field(track_id, "bitrate", bitrate)?;
+        self.set_track_field(track_id, "file_size", file_size)?;
+        self.set_track_field(track_id, "file_type", file_type_code(new_file_path) as u32)?;
+
+        let db = self.database()?;
+        let locs = db.row_locations(TableType::Tracks);
+        let (track, &loc) = db
+            .tracks
+            .iter()
+            .zip(locs)
+            .find(|(t, _)| t.id == track_id)
+            .ok_or(PdbError::TrackNotFound(track_id))?;
+        let _ = track;
+
+        let page_off = (loc / self.page_size) * self.page_size;
+        let row_end = self.row_alloc_end(page_off, loc)?;
+
+        // String offsets are u16 relative to the row start (at loc).
+        let off19 = self.u16(loc + 0x5e + 2 * 19) as usize;
+        let strings_start = loc + off19;
+        if strings_start >= row_end {
+            return Err(PdbError::RowTooLarge {
+                alloc: 0,
+                max: row_end.saturating_sub(loc),
+            });
+        }
+
+        let enc_name = encode_string(new_filename)?;
+        let enc_path = encode_string(new_file_path)?;
+
+        // Pack like rekordbox: long (even kind) strings 4-byte align relative to row.
+        let mut blob = Vec::new();
+        let mut pos = off19;
+        let mut new_off19 = pos;
+        // filename (slot 19)
+        if enc_name[0] & 1 == 0 && pos % 4 != 0 {
+            let pad = 4 - pos % 4;
+            blob.extend(std::iter::repeat(0u8).take(pad));
+            pos += pad;
+            new_off19 = pos;
+        }
+        blob.extend_from_slice(&enc_name);
+        pos += enc_name.len();
+
+        let mut new_off20 = pos;
+        if enc_path[0] & 1 == 0 && pos % 4 != 0 {
+            let pad = 4 - pos % 4;
+            blob.extend(std::iter::repeat(0u8).take(pad));
+            pos += pad;
+            new_off20 = pos;
+        }
+        blob.extend_from_slice(&enc_path);
+        pos += enc_path.len();
+
+        let available = row_end - strings_start;
+        if blob.len() > available {
+            return Err(PdbError::RowTooLarge {
+                alloc: blob.len(),
+                max: available,
+            });
+        }
+
+        // Zero the old tail, write new strings, update offsets.
+        self.buf[strings_start..row_end].fill(0);
+        self.buf[strings_start..strings_start + blob.len()].copy_from_slice(&blob);
+        self.put_u16(loc + 0x5e + 2 * 19, new_off19 as u16);
+        self.put_u16(loc + 0x5e + 2 * 20, new_off20 as u16);
+
+        // Touch generation so players notice the edit.
+        let page_index = (loc / self.page_size) as u32;
+        self.mark_table_touched(TableType::Tracks as u32, page_index)?;
+        let _ = pos;
+        Ok(())
+    }
+
+    /// Absolute file offset of the first byte past this row's allocation.
+    fn row_alloc_end(&self, page_off: usize, row_abs: usize) -> Result<usize> {
+        let heap_base = page_off + PAGE_HEADER_SIZE;
+        let this_rel = row_abs - heap_base;
+        let n = self.slot_count(page_off);
+        let mut offsets = Vec::with_capacity(n as usize);
+        let groups = n.div_ceil(16);
+        for group in 0..groups {
+            let base = page_off + self.page_size - group as usize * 0x24;
+            let in_group = std::cmp::min(16, n - group * 16);
+            let present = self.u16(base - 4);
+            for i in 0..in_group {
+                if (present >> i) & 1 != 0 {
+                    offsets.push(self.u16(base - 6 - 2 * i as usize) as usize);
+                }
+            }
+        }
+        offsets.sort_unstable();
+        let used = self.u16(page_off + 0x1e) as usize;
+        if let Some(idx) = offsets.iter().position(|&o| o == this_rel) {
+            if let Some(&next) = offsets.get(idx + 1) {
+                return Ok(heap_base + next);
+            }
+        }
+        Ok(heap_base + used)
     }
 }

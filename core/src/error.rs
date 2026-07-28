@@ -25,4 +25,8 @@ pub enum Error {
     /// Pioneer database parse failure.
     #[error("database error: {0}")]
     Database(String),
+
+    /// FFmpeg or conversion failure.
+    #[error("conversion error: {0}")]
+    Convert(String),
 }

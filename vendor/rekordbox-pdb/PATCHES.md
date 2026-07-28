@@ -9,3 +9,5 @@
 # - decode_string: ISRC slot (0x90 + inner 0x03 + ASCII) per FORMAT.md
 # - decode_string: never aborts whole-database read on a single bad string
 # - Track::parse: zero string offsets mean empty, not row header bytes
+# - PdbEditor::update_track_audio: in-place filename/path/bitrate/size/file_type
+#   rewrite for FLAC→MP3 (keeps track IDs stable)

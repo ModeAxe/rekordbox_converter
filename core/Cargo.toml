@@ -12,7 +12,10 @@ description = "Core engine: USB detection, Rekordbox export scanning, PDB/ANLZ r
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 walkdir = "2"
+crc32fast = "1"
+rayon = "1"
 rekordbox-pdb = { path = "../vendor/rekordbox-pdb" }
 rekordcrate = { version = "0.3.0", default-features = false, optional = true }
 binrw = { version = "0.14", optional = true }
