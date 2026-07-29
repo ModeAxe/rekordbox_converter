@@ -9,14 +9,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rbusb_core::cache;
 use rbusb_core::convert::{self, ConvertOptions, ConvertProgress, ConvertSummary};
 use rbusb_core::pdb::{
     inspect_export, list_playlists, resolve_convert_scope, ConvertScope, ExportInspect,
     PlaylistOption,
 };
-use rbusb_core::pipeline::{self, PipelineProgress, StagedCopyOptions, StagedCopySummary};
+use rbusb_core::pipeline::{
+    self, InPlaceOptions, InPlaceSummary, PipelineProgress, StagedCopyOptions, StagedCopySummary,
+};
 use rbusb_core::scanner::{self, ExportScan};
+use rbusb_core::settings::{self, AppSettings};
 use rbusb_core::usb::{self, DriveInfo};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -68,9 +70,21 @@ struct CacheInfo {
 
 #[tauri::command]
 fn get_cache_root() -> CacheInfo {
+    let s = settings::load();
     CacheInfo {
-        root: cache::default_cache_root().display().to_string(),
+        root: s.resolved_cache_root().display().to_string(),
     }
+}
+
+#[tauri::command]
+fn get_settings() -> AppSettings {
+    settings::load()
+}
+
+#[tauri::command]
+fn save_settings(settings: AppSettings) -> Result<AppSettings, String> {
+    settings::save(&settings).map_err(|e| e.to_string())?;
+    Ok(settings)
 }
 
 /// Convert FLACs into the local cache. Pass `playlist_id` to limit scope;
@@ -81,8 +95,8 @@ fn convert_to_cache(
     state: State<'_, AppState>,
     root: String,
     playlist_id: Option<u32>,
-    workers: Option<u32>,
 ) -> Result<ConvertSummary, String> {
+    let cfg = settings::load();
     let scope = resolve_convert_scope(&root, playlist_id).map_err(|e| e.to_string())?;
     if scope.flac_paths.is_empty() {
         return Ok(ConvertSummary {
@@ -90,7 +104,7 @@ fn convert_to_cache(
             cache_hits: 0,
             converted: 0,
             failed: 0,
-            cache_root: cache::default_cache_root().display().to_string(),
+            cache_root: cfg.resolved_cache_root().display().to_string(),
             errors: Vec::new(),
         });
     }
@@ -115,18 +129,13 @@ fn convert_to_cache(
         *slot = Some(Arc::clone(&cancel));
     }
 
-    let mut options = ConvertOptions {
+    let options = ConvertOptions {
         ffmpeg_path: ffmpeg,
-        cache_root: cache::default_cache_root(),
-        bitrate: "320k".into(),
-        workers: workers.unwrap_or(0) as usize,
+        cache_root: cfg.resolved_cache_root(),
+        bitrate: cfg.bitrate.clone(),
+        workers: cfg.resolved_workers(),
         contents_root: contents,
     };
-    if options.workers == 0 {
-        options.workers = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 8))
-            .unwrap_or(2);
-    }
 
     let flacs: Vec<PathBuf> = scope.flac_paths.iter().map(PathBuf::from).collect();
     let app_for_progress = app.clone();
@@ -180,8 +189,8 @@ fn build_staged_copy(
     root: String,
     playlist_id: Option<u32>,
     output_name: Option<String>,
-    workers: Option<u32>,
 ) -> Result<StagedCopySummary, String> {
+    let cfg = settings::load();
     let ffmpeg = sidecar::sidecar_path("ffmpeg").map_err(|e| e.to_string())?;
     if !ffmpeg.is_file() {
         return Err(format!("ffmpeg sidecar not found at {}", ffmpeg.display()));
@@ -204,23 +213,14 @@ fn build_staged_copy(
         *slot = Some(Arc::clone(&cancel));
     }
 
-    let workers = workers.unwrap_or(0) as usize;
-    let workers = if workers == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 8))
-            .unwrap_or(2)
-    } else {
-        workers
-    };
-
     let options = StagedCopyOptions {
         source_root: PathBuf::from(&root),
         output_root,
         playlist_id,
         ffmpeg_path: ffmpeg,
-        cache_root: cache::default_cache_root(),
-        bitrate: "320k".into(),
-        workers,
+        cache_root: cfg.resolved_cache_root(),
+        bitrate: cfg.bitrate.clone(),
+        workers: cfg.resolved_workers(),
     };
 
     let app_progress = app.clone();
@@ -242,6 +242,58 @@ fn build_staged_copy(
     Ok(summary)
 }
 
+/// Convert scoped FLACs on the live USB (backup → MP3 → rewrite → verify →
+/// delete FLACs). Rolls back the database/ANLZ on failure before FLAC deletion.
+#[tauri::command]
+fn convert_usb_inplace(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    root: String,
+    playlist_id: Option<u32>,
+) -> Result<InPlaceSummary, String> {
+    let cfg = settings::load();
+    let ffmpeg = sidecar::sidecar_path("ffmpeg").map_err(|e| e.to_string())?;
+    if !ffmpeg.is_file() {
+        return Err(format!("ffmpeg sidecar not found at {}", ffmpeg.display()));
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut slot = state.cancel.lock().map_err(|e| e.to_string())?;
+        *slot = Some(Arc::clone(&cancel));
+    }
+
+    let options = InPlaceOptions {
+        usb_root: PathBuf::from(&root),
+        playlist_id,
+        ffmpeg_path: ffmpeg,
+        cache_root: cfg.resolved_cache_root(),
+        bitrate: cfg.bitrate.clone(),
+        workers: cfg.resolved_workers(),
+        keep_flac: cfg.keep_flac,
+        verify_output: cfg.verify_output,
+        dry_run: cfg.dry_run,
+    };
+
+    let app_progress = app.clone();
+    let summary = pipeline::convert_usb_inplace(
+        &options,
+        Some(Arc::clone(&cancel)),
+        move |progress: PipelineProgress| {
+            let _ = app_progress.emit("inplace-progress", &progress);
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    {
+        let mut slot = state.cancel.lock().map_err(|e| e.to_string())?;
+        *slot = None;
+    }
+
+    let _ = app.emit("inplace-finished", &summary);
+    Ok(summary)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -257,10 +309,13 @@ pub fn run() {
             list_export_playlists,
             get_convert_scope,
             get_cache_root,
+            get_settings,
+            save_settings,
             convert_to_cache,
             cancel_conversion,
             get_staged_parent,
-            build_staged_copy
+            build_staged_copy,
+            convert_usb_inplace
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

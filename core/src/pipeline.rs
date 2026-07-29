@@ -1,7 +1,8 @@
-//! Staged-copy pipeline (Phase 4) and (later) in-place USB pipeline (Phase 5).
+//! Staged-copy pipeline (Phase 4) and in-place USB pipeline (Phase 5).
 //!
-//! Phase 4 builds a converted copy of the export under a user-chosen output
-//! directory. The source USB is never modified.
+//! Phase 4 builds a converted copy under a user-chosen output directory.
+//! Phase 5 converts on the live USB with backup + rollback before any FLAC
+//! deletion.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use rekordbox_pdb::Database;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::anlz;
@@ -21,6 +22,9 @@ use crate::pdb::{
     TrackAudioRewrite,
 };
 use crate::scanner::{export_ext_pdb_path, export_pdb_path};
+
+/// Backup folder name written next to the export on the USB.
+pub const BACKUP_DIR_NAME: &str = ".rbconvert-backup";
 
 /// Progress event for the staged-copy pipeline.
 #[derive(Debug, Clone, Serialize)]
@@ -105,6 +109,8 @@ where
             track_rows.push(t);
         }
     }
+
+    let bitrate_kbps = crate::settings::parse_bitrate_kbps(&options.bitrate).unwrap_or(320);
 
     emit(
         &mut on_progress,
@@ -263,7 +269,7 @@ where
             track_id: track.id,
             new_file_path: new_db_path,
             new_filename,
-            bitrate: 320,
+            bitrate: bitrate_kbps,
             file_size,
             analyze_path: track.analyze_path().to_string(),
         });
@@ -481,6 +487,499 @@ pub fn default_staged_parent() -> PathBuf {
             .join("Staged");
     }
     std::env::temp_dir().join("rekordbox-usb-converter-staged")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — in-place USB conversion with backup / rollback
+// ---------------------------------------------------------------------------
+
+/// Options for converting FLACs on the live USB.
+#[derive(Debug, Clone)]
+pub struct InPlaceOptions {
+    pub usb_root: PathBuf,
+    pub playlist_id: Option<u32>,
+    pub ffmpeg_path: PathBuf,
+    pub cache_root: PathBuf,
+    pub bitrate: String,
+    pub workers: usize,
+    /// If true, keep FLACs on the USB after a successful conversion.
+    pub keep_flac: bool,
+    /// Fail the run if post-rewrite verify finds problems (triggers rollback).
+    pub verify_output: bool,
+    /// Resolve scope and report only — no USB writes.
+    pub dry_run: bool,
+}
+
+/// Summary of an in-place conversion.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InPlaceSummary {
+    pub usb_root: String,
+    pub tracks_converted: u32,
+    pub cache_hits: u32,
+    pub pdb_updated: u32,
+    pub anlz_updated: u32,
+    pub flacs_removed: u32,
+    pub rolled_back: bool,
+    pub backup_kept: bool,
+    pub verify_problems: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifest {
+    /// Paths relative to the USB root that were copied into the backup.
+    files: Vec<String>,
+}
+
+/// Converts scoped FLACs on the live USB.
+///
+/// Crash-safe order:
+/// 1. Backup `export.pdb`, `exportExt.pdb`, and affected ANLZ files
+/// 2. Write MP3s alongside FLACs (cache or FFmpeg)
+/// 3. Verify every MP3
+/// 4. Rewrite DB + ANLZ
+/// 5. Re-verify
+/// 6. Delete FLACs (unless `keep_flac`)
+/// 7. Remove backup on success
+///
+/// Any failure before step 6 restores the backed-up files.
+pub fn convert_usb_inplace<F>(
+    options: &InPlaceOptions,
+    cancel: Option<Arc<AtomicBool>>,
+    mut on_progress: F,
+) -> Result<InPlaceSummary>
+where
+    F: FnMut(PipelineProgress) + Send,
+{
+    let root = options.usb_root.as_path();
+    if !export_pdb_path(root).is_file() {
+        return Err(Error::NotARekordboxExport(root.display().to_string()));
+    }
+
+    let scope = resolve_convert_scope(root, options.playlist_id)?;
+    if scope.flac_paths.is_empty() {
+        return Err(Error::Message(
+            "no FLAC tracks in the selected scope".into(),
+        ));
+    }
+
+    let db = Database::from_file(export_pdb_path(root))
+        .map_err(|e| Error::Database(e.to_string()))?;
+    let expected_tracks = db.tracks.len();
+    let expected_entries = db.playlist_entries.len();
+
+    let scope_paths: Vec<PathBuf> = scope.flac_paths.iter().map(PathBuf::from).collect();
+    let mut track_rows: Vec<&rekordbox_pdb::Track> = Vec::new();
+    for t in &db.tracks {
+        let abs = resolve_usb_path(root, t.file_path());
+        if scope_paths.iter().any(|p| paths_loose_eq(p, &abs)) {
+            track_rows.push(t);
+        }
+    }
+
+    let bitrate_kbps = crate::settings::parse_bitrate_kbps(&options.bitrate).unwrap_or(320);
+
+    if options.dry_run {
+        emit(
+            &mut on_progress,
+            "dry-run",
+            0,
+            1,
+            format!(
+                "Dry run: would convert {} FLAC(s), rewrite {} track row(s)",
+                scope_paths.len(),
+                track_rows.len()
+            ),
+        );
+        return Ok(InPlaceSummary {
+            usb_root: root.display().to_string(),
+            tracks_converted: 0,
+            cache_hits: 0,
+            pdb_updated: 0,
+            anlz_updated: 0,
+            flacs_removed: 0,
+            rolled_back: false,
+            backup_kept: false,
+            verify_problems: Vec::new(),
+            errors: vec![format!(
+                "dry run — no changes written ({} FLAC → MP3 @ {})",
+                scope_paths.len(),
+                options.bitrate
+            )],
+        });
+    }
+
+    let backup_root = root.join(BACKUP_DIR_NAME);
+    if backup_root.exists() {
+        return Err(Error::Message(format!(
+            "backup folder already exists at {} — remove or rename it before converting",
+            backup_root.display()
+        )));
+    }
+
+    // ---- 1. Backup -------------------------------------------------------
+    emit(
+        &mut on_progress,
+        "backup",
+        0,
+        1,
+        "Backing up database and analysis files",
+    );
+    let manifest = create_backup(root, &backup_root, &track_rows)?;
+
+    let mut errors = Vec::new();
+    let mut cache_hits = 0u32;
+    let mut converted = 0u32;
+    let mut anlz_updated = 0u32;
+    let mut flacs_removed = 0u32;
+    let mut pdb_updated = 0u32;
+    let mut rolled_back = false;
+    let mut backup_kept = true;
+
+    let result = (|| -> Result<()> {
+        check_cancel(&cancel)?;
+
+        // ---- 2. Convert MP3s alongside FLACs -----------------------------
+        let cache = CacheManager::new(&options.cache_root);
+        cache.ensure_root()?;
+        let contents = {
+            let c = root.join("Contents");
+            if c.is_dir() {
+                Some(c)
+            } else {
+                None
+            }
+        };
+        let convert_opts = ConvertOptions {
+            ffmpeg_path: options.ffmpeg_path.clone(),
+            cache_root: options.cache_root.clone(),
+            bitrate: options.bitrate.clone(),
+            workers: options.workers.max(1),
+            contents_root: contents.clone(),
+        };
+
+        let total = scope_paths.len() as u32;
+        let done = AtomicU32::new(0);
+        for flac in &scope_paths {
+            check_cancel(&cancel)?;
+            if !flac.is_file() {
+                errors.push(format!("FLAC missing: {}", flac.display()));
+                continue;
+            }
+            let name = file_name(flac);
+            match place_mp3_beside_flac(
+                flac,
+                flac,
+                contents.as_deref(),
+                &cache,
+                &convert_opts,
+            ) {
+                Ok(ConvertPlace::CacheHit) => cache_hits += 1,
+                Ok(ConvertPlace::Converted) => converted += 1,
+                Err(e) => {
+                    errors.push(format!("{name}: {e}"));
+                }
+            }
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            emit(
+                &mut on_progress,
+                "convert",
+                n,
+                total,
+                format!("Placed MP3 for {name}"),
+            );
+        }
+
+        if !errors.is_empty() && converted + cache_hits == 0 {
+            return Err(Error::Message(
+                "every conversion failed — see errors".into(),
+            ));
+        }
+
+        // ---- 3. Verify MP3s before touching the DB -----------------------
+        emit(&mut on_progress, "verify-mp3", 0, 1, "Verifying MP3 files");
+        let mut rewrites = Vec::new();
+        let mut rewritten_ids = Vec::new();
+        for track in &track_rows {
+            let flac = resolve_usb_path(root, track.file_path());
+            let mp3 = flac.with_extension("mp3");
+            if !mp3.is_file() || mp3.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+                errors.push(format!(
+                    "MP3 missing/empty before DB rewrite: {}",
+                    mp3.display()
+                ));
+                continue;
+            }
+            let file_size = mp3.metadata().map(|m| m.len() as u32).unwrap_or(0);
+            let new_db_path = db_path_flac_to_mp3(track.file_path());
+            let new_filename = PathBuf::from(&new_db_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| new_db_path.clone());
+            rewrites.push(TrackAudioRewrite {
+                track_id: track.id,
+                new_file_path: new_db_path,
+                new_filename,
+                bitrate: bitrate_kbps,
+                file_size,
+                analyze_path: track.analyze_path().to_string(),
+            });
+            rewritten_ids.push(track.id);
+        }
+
+        if rewrites.is_empty() {
+            return Err(Error::Message(
+                "no tracks ready for database rewrite".into(),
+            ));
+        }
+
+        // ---- 4. Rewrite PDB + ANLZ ---------------------------------------
+        emit(
+            &mut on_progress,
+            "rewrite-pdb",
+            0,
+            1,
+            "Rewriting export.pdb",
+        );
+        let pdb_summary = rewrite_track_audio(export_pdb_path(root), &rewrites)?;
+        pdb_updated = pdb_summary.updated;
+        for f in pdb_summary.failed {
+            errors.push(f);
+        }
+
+        emit(
+            &mut on_progress,
+            "rewrite-anlz",
+            0,
+            1,
+            "Rewriting ANLZ PPTH tags",
+        );
+        for r in &rewrites {
+            if r.analyze_path.is_empty() {
+                continue;
+            }
+            let anlz_dat = resolve_usb_path(root, &r.analyze_path);
+            let Some(dir) = anlz_dat.parent() else {
+                continue;
+            };
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if !name.starts_with("ANLZ") {
+                        continue;
+                    }
+                    match anlz::rewrite_ppath(&p, &r.new_file_path) {
+                        Ok(()) => anlz_updated += 1,
+                        Err(e) => errors.push(format!("{}: {e}", p.display())),
+                    }
+                }
+            }
+        }
+
+        // ---- 5. Re-verify ------------------------------------------------
+        emit(
+            &mut on_progress,
+            "verify-db",
+            0,
+            1,
+            "Verifying database consistency",
+        );
+        let verify_problems = verify_rewritten_pdb(
+            root,
+            export_pdb_path(root),
+            expected_tracks,
+            expected_entries,
+            &rewritten_ids,
+        )?;
+        if options.verify_output && !verify_problems.is_empty() {
+            return Err(Error::Message(format!(
+                "verification failed:\n{}",
+                verify_problems.join("\n")
+            )));
+        }
+        if !verify_problems.is_empty() {
+            for p in verify_problems {
+                errors.push(format!("verify (ignored): {p}"));
+            }
+        }
+
+        // ---- 6. Delete FLACs (in-memory track rows still point at .flac) --
+        if !options.keep_flac {
+            emit(&mut on_progress, "cleanup", 0, 1, "Removing FLACs from USB");
+            for flac in &scope_paths {
+                let mp3 = flac.with_extension("mp3");
+                if flac.is_file() && mp3.is_file() {
+                    match fs::remove_file(flac) {
+                        Ok(()) => flacs_removed += 1,
+                        Err(e) => errors.push(format!(
+                            "could not delete {}: {e}",
+                            flac.display()
+                        )),
+                    }
+                }
+            }
+        }
+
+        // ---- 7. Remove backup --------------------------------------------
+        emit(&mut on_progress, "finalize", 0, 1, "Removing backup");
+        let _ = fs::remove_dir_all(&backup_root);
+        backup_kept = false;
+        let _ = manifest; // written for crash recovery if we crash mid-run
+
+        Ok(())
+    })();
+
+    if let Err(ref e) = result {
+        emit(
+            &mut on_progress,
+            "rollback",
+            0,
+            1,
+            format!("Rolling back: {e}"),
+        );
+        if let Err(rb) = restore_backup(root, &backup_root) {
+            errors.push(format!("rollback failed: {rb}"));
+        } else {
+            rolled_back = true;
+            // Keep backup so the user can inspect / recover manually if needed.
+            backup_kept = true;
+        }
+        errors.push(e.to_string());
+    }
+
+    emit(
+        &mut on_progress,
+        "done",
+        1,
+        1,
+        if rolled_back {
+            "Rolled back — USB database restored from backup".to_string()
+        } else {
+            "USB conversion finished".to_string()
+        },
+    );
+
+    // Surface verify problems only on success path (already folded into Err).
+    Ok(InPlaceSummary {
+        usb_root: root.display().to_string(),
+        tracks_converted: converted + cache_hits,
+        cache_hits,
+        pdb_updated,
+        anlz_updated,
+        flacs_removed,
+        rolled_back,
+        backup_kept,
+        verify_problems: Vec::new(),
+        errors,
+    })
+}
+
+fn create_backup(
+    usb_root: &Path,
+    backup_root: &Path,
+    tracks: &[&rekordbox_pdb::Track],
+) -> Result<BackupManifest> {
+    fs::create_dir_all(backup_root)?;
+    let mut files = Vec::new();
+
+    let pdb = export_pdb_path(usb_root);
+    backup_one(usb_root, backup_root, &pdb, &mut files)?;
+
+    let ext = export_ext_pdb_path(usb_root);
+    if ext.is_file() {
+        backup_one(usb_root, backup_root, &ext, &mut files)?;
+    }
+
+    for track in tracks {
+        if track.analyze_path().is_empty() {
+            continue;
+        }
+        let anlz_dat = resolve_usb_path(usb_root, track.analyze_path());
+        let Some(dir) = anlz_dat.parent() else {
+            continue;
+        };
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with("ANLZ") {
+                    backup_one(usb_root, backup_root, &p, &mut files)?;
+                }
+            }
+        }
+    }
+
+    let manifest = BackupManifest { files };
+    let manifest_path = backup_root.join("manifest.json");
+    let json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| Error::Message(e.to_string()))?;
+    fs::write(manifest_path, json)?;
+    Ok(manifest)
+}
+
+fn backup_one(
+    usb_root: &Path,
+    backup_root: &Path,
+    abs: &Path,
+    files: &mut Vec<String>,
+) -> Result<()> {
+    if !abs.is_file() {
+        return Ok(());
+    }
+    let rel = abs
+        .strip_prefix(usb_root)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|_| PathBuf::from(abs.file_name().unwrap_or_default()));
+    let dest = backup_root.join(&rel);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(abs, &dest)?;
+    files.push(rel.to_string_lossy().replace('\\', "/"));
+    Ok(())
+}
+
+fn restore_backup(usb_root: &Path, backup_root: &Path) -> Result<()> {
+    let manifest_path = backup_root.join("manifest.json");
+    let files: Vec<String> = if manifest_path.is_file() {
+        let data = fs::read_to_string(&manifest_path)?;
+        let m: BackupManifest =
+            serde_json::from_str(&data).map_err(|e| Error::Message(e.to_string()))?;
+        m.files
+    } else {
+        // Fallback: restore everything under backup.
+        let mut all = Vec::new();
+        for entry in WalkDir::new(backup_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_file()
+                && entry.file_name() != "manifest.json"
+            {
+                if let Ok(rel) = entry.path().strip_prefix(backup_root) {
+                    all.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        all
+    };
+
+    for rel in files {
+        let src = backup_root.join(&rel);
+        let dest = usb_root.join(&rel);
+        if !src.is_file() {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&src, &dest)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

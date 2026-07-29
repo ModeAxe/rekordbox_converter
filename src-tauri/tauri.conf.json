@@ -9,14 +9,14 @@
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
-  "app": {
+    "app": {
     "windows": [
       {
         "title": "Rekordbox USB Converter",
-        "width": 560,
-        "height": 720,
-        "minWidth": 480,
-        "minHeight": 600,
+        "width": 380,
+        "height": 540,
+        "minWidth": 340,
+        "minHeight": 420,
         "resizable": true
       }
     ],

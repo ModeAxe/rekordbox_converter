@@ -129,6 +129,25 @@ type PipelineState =
   | { state: "done"; summary: StagedCopySummary }
   | { state: "error"; message: string };
 
+type InPlaceSummary = {
+  usbRoot: string;
+  tracksConverted: number;
+  cacheHits: number;
+  pdbUpdated: number;
+  anlzUpdated: number;
+  flacsRemoved: number;
+  rolledBack: boolean;
+  backupKept: boolean;
+  verifyProblems: string[];
+  errors: string[];
+};
+
+type InPlaceState =
+  | { state: "idle" }
+  | { state: "running"; progress: PipelineProgress | null }
+  | { state: "done"; summary: InPlaceSummary }
+  | { state: "error"; message: string };
+
 type PlaylistOption = {
   id: number;
   name: string;
@@ -147,18 +166,35 @@ type ConvertScope = {
   estimatedSeconds: number;
 };
 
-/** Sentinel for "all FLACs on the USB". */
-const PLAYLIST_ALL = "";
+type AppSettings = {
+  bitrate: string;
+  cacheRoot: string;
+  workers: number;
+  keepFlac: boolean;
+  verifyOutput: boolean;
+  dryRun: boolean;
+};
 
-const POLL_MS = 2500;
+type TabId = "convert" | "inspect" | "settings";
+
+const PLAYLIST_ALL = "";
+const POLL_MS = 2000;
+const DEFAULT_SETTINGS: AppSettings = {
+  bitrate: "320k",
+  cacheRoot: "",
+  workers: 0,
+  keepFlac: false,
+  verifyOutput: true,
+  dryRun: false,
+};
 
 export default function App() {
-  const [appVersion, setAppVersion] = useState<string>("");
+  const [appVersion, setAppVersion] = useState("");
+  const [tab, setTab] = useState<TabId>("convert");
   const [ffmpeg, setFfmpeg] = useState<FfmpegStatus>({ state: "checking" });
   const [drives, setDrives] = useState<DriveInfo[]>([]);
-  const [selectedRoot, setSelectedRoot] = useState<string>("");
+  const [selectedRoot, setSelectedRoot] = useState("");
   const [scanState, setScanState] = useState<ScanState>({ state: "idle" });
-  const [view, setView] = useState<"main" | "inspect">("main");
   const [inspectState, setInspectState] = useState<InspectState>({
     state: "idle",
   });
@@ -168,13 +204,19 @@ export default function App() {
   const [pipelineState, setPipelineState] = useState<PipelineState>({
     state: "idle",
   });
-  const [cacheRoot, setCacheRoot] = useState<string>("");
-  const [stagedParent, setStagedParent] = useState<string>("");
+  const [inplaceState, setInplaceState] = useState<InPlaceState>({
+    state: "idle",
+  });
+  const [defaultCacheRoot, setDefaultCacheRoot] = useState("");
+  const [stagedParent, setStagedParent] = useState("");
   const [playlists, setPlaylists] = useState<PlaylistOption[]>([]);
-  const [playlistSelect, setPlaylistSelect] = useState<string>(PLAYLIST_ALL);
+  const [playlistSelect, setPlaylistSelect] = useState(PLAYLIST_ALL);
   const [scope, setScope] = useState<ConvertScope | null>(null);
-  const [scopeEstimate, setScopeEstimate] = useState<string>("—");
+  const [scopeEstimate, setScopeEstimate] = useState("—");
   const [scopeLoading, setScopeLoading] = useState(false);
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [settingsDraft, setSettingsDraft] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [settingsMsg, setSettingsMsg] = useState("");
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => setAppVersion("?"));
@@ -182,16 +224,23 @@ export default function App() {
       .then((version) => setFfmpeg({ state: "ok", version }))
       .catch((err) => setFfmpeg({ state: "error", message: String(err) }));
     invoke<{ root: string }>("get_cache_root")
-      .then((info) => setCacheRoot(info.root))
-      .catch(() => setCacheRoot(""));
+      .then((info) => setDefaultCacheRoot(info.root))
+      .catch(() => setDefaultCacheRoot(""));
     invoke<{ root: string }>("get_staged_parent")
       .then((info) => setStagedParent(info.root))
       .catch(() => setStagedParent(""));
+    invoke<AppSettings>("get_settings")
+      .then((s) => {
+        setSettings(s);
+        setSettingsDraft(s);
+      })
+      .catch(() => {
+        /* defaults */
+      });
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-
     const refresh = async () => {
       try {
         const next = await invoke<DriveInfo[]>("list_drives");
@@ -204,10 +253,9 @@ export default function App() {
           return preferred?.root ?? "";
         });
       } catch {
-        /* keep previous list */
+        /* keep previous */
       }
     };
-
     refresh();
     const id = window.setInterval(refresh, POLL_MS);
     return () => {
@@ -219,146 +267,179 @@ export default function App() {
   useEffect(() => {
     if (!selectedRoot) {
       setScanState({ state: "idle" });
-      setInspectState({ state: "idle" });
       setPlaylists([]);
-      setPlaylistSelect(PLAYLIST_ALL);
-      setScope(null);
       return;
     }
-
     let cancelled = false;
-    setScanState({ state: "scanning" });
-    setInspectState({ state: "idle" });
-    setConvertState({ state: "idle" });
-    setPipelineState({ state: "idle" });
-    setPlaylists([]);
-    setPlaylistSelect(PLAYLIST_ALL);
-
     (async () => {
+      setScanState({ state: "scanning" });
       try {
         const scan = await invoke<ExportScan>("scan_drive", {
           root: selectedRoot,
         });
-        if (cancelled) return;
         const estimate = await invoke<string>("format_estimate", {
           seconds: scan.estimatedSeconds,
         });
         if (cancelled) return;
         setScanState({ state: "ready", scan, estimate });
-
-        try {
-          const pls = await invoke<PlaylistOption[]>("list_export_playlists", {
+        if (scan.flacCount > 0 || scan.totalTracks > 0) {
+          const list = await invoke<PlaylistOption[]>("list_export_playlists", {
             root: selectedRoot,
           });
-          if (!cancelled) setPlaylists(pls);
-        } catch {
-          if (!cancelled) setPlaylists([]);
+          if (!cancelled) setPlaylists(list);
+        } else {
+          setPlaylists([]);
         }
       } catch (err) {
-        if (cancelled) return;
-        setScanState({ state: "error", message: String(err) });
+        if (!cancelled) setScanState({ state: "error", message: String(err) });
       }
     })();
-
     return () => {
       cancelled = true;
     };
   }, [selectedRoot]);
 
-  // Refresh convert scope whenever drive or playlist selection changes.
   useEffect(() => {
-    if (!selectedRoot || scanState.state !== "ready") {
+    if (scanState.state !== "ready" || !selectedRoot) {
       setScope(null);
       setScopeEstimate("—");
       return;
     }
-
     let cancelled = false;
     setScopeLoading(true);
     const playlistId =
       playlistSelect === PLAYLIST_ALL ? null : Number(playlistSelect);
-
     (async () => {
       try {
         const next = await invoke<ConvertScope>("get_convert_scope", {
           root: selectedRoot,
           playlistId,
         });
-        if (cancelled) return;
-        setScope(next);
         const estimate = await invoke<string>("format_estimate", {
           seconds: next.estimatedSeconds,
         });
         if (cancelled) return;
-        setScopeEstimate(
-          next.flacCount === 0 ? "Nothing to convert" : estimate,
-        );
+        setScope(next);
+        setScopeEstimate(estimate);
       } catch (err) {
-        if (cancelled) return;
-        setScope(null);
-        setScopeEstimate("—");
         console.error(err);
       } finally {
         if (!cancelled) setScopeLoading(false);
       }
     })();
-
     return () => {
       cancelled = true;
     };
   }, [selectedRoot, playlistSelect, scanState]);
 
   useEffect(() => {
-    let unlistenProgress: (() => void) | undefined;
-    let unlistenFinished: (() => void) | undefined;
-    let unlistenPipelineProgress: (() => void) | undefined;
-    let unlistenPipelineFinished: (() => void) | undefined;
+    let u1: (() => void) | undefined;
+    let u2: (() => void) | undefined;
+    let u3: (() => void) | undefined;
+    let u4: (() => void) | undefined;
+    let u5: (() => void) | undefined;
+    let u6: (() => void) | undefined;
 
-    listen<ConvertProgress>("conversion-progress", (event) => {
-      setConvertState({ state: "running", progress: event.payload });
+    listen<ConvertProgress>("conversion-progress", (e) => {
+      setConvertState({ state: "running", progress: e.payload });
     }).then((fn) => {
-      unlistenProgress = fn;
+      u1 = fn;
     });
-
-    listen<ConvertSummary>("conversion-finished", (event) => {
-      setConvertState({ state: "done", summary: event.payload });
+    listen<ConvertSummary>("conversion-finished", (e) => {
+      setConvertState({ state: "done", summary: e.payload });
     }).then((fn) => {
-      unlistenFinished = fn;
+      u2 = fn;
     });
-
-    listen<PipelineProgress>("pipeline-progress", (event) => {
-      setPipelineState({ state: "running", progress: event.payload });
+    listen<PipelineProgress>("pipeline-progress", (e) => {
+      setPipelineState({ state: "running", progress: e.payload });
     }).then((fn) => {
-      unlistenPipelineProgress = fn;
+      u3 = fn;
     });
-
-    listen<StagedCopySummary>("pipeline-finished", (event) => {
-      setPipelineState({ state: "done", summary: event.payload });
+    listen<StagedCopySummary>("pipeline-finished", (e) => {
+      setPipelineState({ state: "done", summary: e.payload });
     }).then((fn) => {
-      unlistenPipelineFinished = fn;
+      u4 = fn;
+    });
+    listen<PipelineProgress>("inplace-progress", (e) => {
+      setInplaceState({ state: "running", progress: e.payload });
+    }).then((fn) => {
+      u5 = fn;
+    });
+    listen<InPlaceSummary>("inplace-finished", (e) => {
+      setInplaceState({ state: "done", summary: e.payload });
+    }).then((fn) => {
+      u6 = fn;
     });
 
     return () => {
-      unlistenProgress?.();
-      unlistenFinished?.();
-      unlistenPipelineProgress?.();
-      unlistenPipelineFinished?.();
+      u1?.();
+      u2?.();
+      u3?.();
+      u4?.();
+      u5?.();
+      u6?.();
     };
   }, []);
 
-  const loadInspect = async () => {
-    if (!selectedRoot) return;
-    setInspectState({ state: "loading" });
-    setView("inspect");
-    try {
-      const data = await invoke<ExportInspect>("inspect_drive", {
-        root: selectedRoot,
-      });
-      setInspectState({ state: "ready", data });
-    } catch (err) {
-      setInspectState({ state: "error", message: String(err) });
+  const selected = drives.find((d) => d.root === selectedRoot);
+  const converting = convertState.state === "running";
+  const staging = pipelineState.state === "running";
+  const inplace = inplaceState.state === "running";
+  const busy = converting || staging || inplace;
+  const scopeFlacCount = scope?.flacCount ?? 0;
+  const canConvert =
+    scanState.state === "ready" &&
+    scopeFlacCount > 0 &&
+    ffmpeg.state === "ok" &&
+    !busy &&
+    !scopeLoading;
+  const canInspect = (selected?.isRekordboxExport ?? false) && !busy;
+
+  const statusLine = (() => {
+    if (converting && convertState.progress) {
+      return `${convertState.progress.completed}/${convertState.progress.total} ${convertState.progress.currentFile}`;
     }
-  };
+    if (staging && pipelineState.progress) {
+      return `${pipelineState.progress.phase}: ${pipelineState.progress.detail}`;
+    }
+    if (inplace && inplaceState.progress) {
+      return `${inplaceState.progress.phase}: ${inplaceState.progress.detail}`;
+    }
+    if (busy) return "Working…";
+    if (ffmpeg.state === "error") return "FFmpeg missing";
+    if (!selectedRoot) return "Insert a USB drive";
+    if (selected && !selected.isRekordboxExport) return "No export.pdb on drive";
+    if (scanState.state === "ready") {
+      return `${scanState.scan.flacCount} FLAC · ${scanState.scan.mp3Count} MP3 · est ${scopeEstimate}`;
+    }
+    if (scanState.state === "scanning") return "Scanning…";
+    return "Ready";
+  })();
+
+  const resultText = (() => {
+    if (inplaceState.state === "done" && inplaceState.summary.rolledBack) {
+      return `Rolled back. ${inplaceState.summary.errors.join(" ")}`;
+    }
+    if (inplaceState.state === "done") {
+      const s = inplaceState.summary;
+      if (s.errors.some((e) => e.startsWith("dry run"))) {
+        return s.errors[0];
+      }
+      return `USB OK — ${s.pdbUpdated} tracks, ${s.flacsRemoved} FLAC removed`;
+    }
+    if (pipelineState.state === "done") {
+      const s = pipelineState.summary;
+      return `Copy ready — ${s.outputRoot}`;
+    }
+    if (convertState.state === "done") {
+      const s = convertState.summary;
+      return `Cache: ${s.converted} new, ${s.cacheHits} hits`;
+    }
+    if (inplaceState.state === "error") return inplaceState.message;
+    if (pipelineState.state === "error") return pipelineState.message;
+    if (convertState.state === "error") return convertState.message;
+    return "";
+  })();
 
   const startConvert = async () => {
     if (!selectedRoot) return;
@@ -369,7 +450,6 @@ export default function App() {
       const summary = await invoke<ConvertSummary>("convert_to_cache", {
         root: selectedRoot,
         playlistId,
-        workers: null,
       });
       setConvertState({ state: "done", summary });
     } catch (err) {
@@ -387,7 +467,6 @@ export default function App() {
         root: selectedRoot,
         playlistId,
         outputName: null,
-        workers: null,
       });
       setPipelineState({ state: "done", summary });
     } catch (err) {
@@ -395,438 +474,463 @@ export default function App() {
     }
   };
 
-  const selected = drives.find((d) => d.root === selectedRoot);
-  const converting = convertState.state === "running";
-  const staging = pipelineState.state === "running";
-  const busy = converting || staging;
-  const scopeFlacCount = scope?.flacCount ?? 0;
-  const canConvert =
-    scanState.state === "ready" &&
-    scopeFlacCount > 0 &&
-    ffmpeg.state === "ok" &&
-    !busy &&
-    !scopeLoading;
-  const canInspect = (selected?.isRekordboxExport ?? false) && !busy;
+  const startInPlace = async () => {
+    if (!selectedRoot) return;
+    if (!settings.dryRun) {
+      const scopeLabel =
+        playlistSelect === PLAYLIST_ALL
+          ? "ALL FLACs on this USB"
+          : `playlist (${scope?.playlistName ?? "selected"})`;
+      const ok = window.confirm(
+        `Convert ${scopeLabel} in place on ${selectedRoot}?\n\n` +
+          "Rewrites the USB database and replaces FLACs with MP3s.\n" +
+          "Failure before FLAC delete rolls the DB back.",
+      );
+      if (!ok) return;
+    }
+
+    setInplaceState({ state: "running", progress: null });
+    const playlistId =
+      playlistSelect === PLAYLIST_ALL ? null : Number(playlistSelect);
+    try {
+      const summary = await invoke<InPlaceSummary>("convert_usb_inplace", {
+        root: selectedRoot,
+        playlistId,
+      });
+      setInplaceState({ state: "done", summary });
+      if (!summary.rolledBack && !settings.dryRun) {
+        try {
+          const scan = await invoke<ExportScan>("scan_drive", {
+            root: selectedRoot,
+          });
+          const estimate = await invoke<string>("format_estimate", {
+            seconds: scan.estimatedSeconds,
+          });
+          setScanState({ state: "ready", scan, estimate });
+        } catch {
+          /* keep */
+        }
+      }
+    } catch (err) {
+      setInplaceState({ state: "error", message: String(err) });
+    }
+  };
+
+  const loadInspect = async () => {
+    if (!selectedRoot) return;
+    setTab("inspect");
+    setInspectState({ state: "loading" });
+    try {
+      const data = await invoke<ExportInspect>("inspect_drive", {
+        root: selectedRoot,
+      });
+      setInspectState({ state: "ready", data });
+    } catch (err) {
+      setInspectState({ state: "error", message: String(err) });
+    }
+  };
+
+  const saveSettings = async () => {
+    try {
+      const saved = await invoke<AppSettings>("save_settings", {
+        settings: settingsDraft,
+      });
+      setSettings(saved);
+      setSettingsDraft(saved);
+      setSettingsMsg("Settings saved.");
+      const info = await invoke<{ root: string }>("get_cache_root");
+      setDefaultCacheRoot(info.root);
+    } catch (err) {
+      setSettingsMsg(String(err));
+    }
+  };
 
   const progressPct =
     convertState.state === "running" && convertState.progress
       ? Math.round(
-          (convertState.progress.completed / convertState.progress.total) * 100,
+          (convertState.progress.completed /
+            Math.max(1, convertState.progress.total)) *
+            100,
         )
-      : convertState.state === "done"
-        ? 100
-        : 0;
-
-  if (view === "inspect") {
-    return (
-      <main className="app inspect-view">
-        <header className="header">
-          <h1>Database Inspect</h1>
-          <button
-            className="link-btn"
-            type="button"
-            onClick={() => setView("main")}
-          >
-            ← Back
-          </button>
-        </header>
-
-        {inspectState.state === "loading" && (
-          <p className="muted empty">Reading export.pdb…</p>
-        )}
-        {inspectState.state === "error" && (
-          <p className="status-value error">{inspectState.message}</p>
-        )}
-        {inspectState.state === "ready" && (
-          <>
-            <section className="card">
-              <h2>Round-trip proof</h2>
-              <div className="status-row">
-                <span className="status-label">rekordbox-pdb</span>
-                <span
-                  className={
-                    inspectState.data.roundtrip.rekordboxPdb.byteIdentical
-                      ? "status-value ok"
-                      : "status-value error"
-                  }
-                >
-                  {inspectState.data.roundtrip.rekordboxPdb.byteIdentical
-                    ? "✔ byte-identical"
-                    : "✘ differs"}{" "}
-                  — {inspectState.data.roundtrip.rekordboxPdb.message}
-                </span>
-              </div>
-              <div className="status-row">
-                <span className="status-label">rekordcrate</span>
-                <span className="status-value muted">
-                  {inspectState.data.roundtrip.rekordcrate.parsed
-                    ? "parsed"
-                    : "failed"}{" "}
-                  — {inspectState.data.roundtrip.rekordcrate.message}
-                </span>
-              </div>
-            </section>
-
-            <section className="card">
-              <h2>Summary</h2>
-              <div className="stats">
-                <div className="stat">
-                  <span className="stat-value">
-                    {inspectState.data.summary.trackCount}
-                  </span>
-                  <span className="stat-label">DB tracks</span>
-                </div>
-                <div className="stat">
-                  <span className="stat-value">
-                    {inspectState.data.summary.playlistCount}
-                  </span>
-                  <span className="stat-label">playlists</span>
-                </div>
-                <div className="stat">
-                  <span className="stat-value accent">
-                    {inspectState.data.summary.flacInDb}
-                  </span>
-                  <span className="stat-label">FLAC in DB</span>
-                </div>
-              </div>
-            </section>
-
-            <section className="card">
-              <h2>Playlists</h2>
-              <ul className="playlist-list">
-                {inspectState.data.playlists
-                  .filter((p) => !p.isFolder)
-                  .map((p) => (
-                    <li key={p.id}>
-                      {p.name}{" "}
-                      <span className="muted">({p.trackCount} tracks)</span>
-                    </li>
-                  ))}
-              </ul>
-            </section>
-
-            <section className="card dump-card">
-              <div className="dump-header">
-                <h2>Full dump</h2>
-                <button
-                  className="link-btn"
-                  type="button"
-                  onClick={() =>
-                    navigator.clipboard.writeText(inspectState.data.textDump)
-                  }
-                >
-                  Copy
-                </button>
-              </div>
-              <pre className="text-dump">{inspectState.data.textDump}</pre>
-            </section>
-          </>
-        )}
-
-        <footer className="footer">Phase 2 — database inspect</footer>
-      </main>
-    );
-  }
+      : staging && pipelineState.progress && pipelineState.progress.total > 0
+        ? Math.round(
+            (pipelineState.progress.completed / pipelineState.progress.total) *
+              100,
+          )
+        : inplace && inplaceState.progress && inplaceState.progress.total > 0
+          ? Math.round(
+              (inplaceState.progress.completed / inplaceState.progress.total) *
+                100,
+            )
+          : busy
+            ? 10
+            : 0;
 
   return (
-    <main className="app">
-      <header className="header">
-        <h1>Rekordbox USB Converter</h1>
-        <span className="version">v{appVersion}</span>
-      </header>
-
-      <section className="card">
-        <h2>USB</h2>
-        {drives.length === 0 ? (
-          <p className="muted empty">
-            No removable drives detected. Plug in a Rekordbox-exported USB.
-          </p>
-        ) : (
-          <select
-            className="drive-select"
-            value={selectedRoot}
-            onChange={(e) => setSelectedRoot(e.target.value)}
-            aria-label="USB drive"
-            disabled={busy}
+    <div className="shell">
+      <menu role="tablist">
+        {(
+          [
+            ["convert", "Convert"],
+            ["inspect", "Inspect"],
+            ["settings", "Settings"],
+          ] as const
+        ).map(([id, label]) => (
+          <li
+            key={id}
+            role="tab"
+            aria-selected={tab === id}
+            onClick={() => setTab(id)}
           >
-            {drives.map((d) => (
-              <option key={d.root} value={d.root}>
-                {d.label}
-                {d.isRekordboxExport ? " — Rekordbox export" : ""}
-              </option>
-            ))}
-          </select>
-        )}
-      </section>
+            <a
+              href={`#${id}`}
+              onClick={(e) => {
+                e.preventDefault();
+                setTab(id);
+              }}
+            >
+              {label}
+            </a>
+          </li>
+        ))}
+      </menu>
 
-      <section className="card">
-        <h2>Status</h2>
-        <div className="status-row">
-          <span className="status-label">FFmpeg</span>
-          {ffmpeg.state === "checking" && (
-            <span className="status-value muted">checking…</span>
+      <div className="window tab-panel" role="tabpanel">
+        <div className="window-body">
+          {tab === "convert" && (
+            <>
+              <fieldset>
+                <legend>USB</legend>
+                <div className="field-row stacked-control">
+                  <label htmlFor="drive">Drive</label>
+                  <select
+                    id="drive"
+                    value={selectedRoot}
+                    disabled={busy || drives.length === 0}
+                    onChange={(e) => setSelectedRoot(e.target.value)}
+                  >
+                    {drives.length === 0 && (
+                      <option value="">(no removable drives)</option>
+                    )}
+                    {drives.map((d) => (
+                      <option key={d.root} value={d.root}>
+                        {d.label}
+                        {d.isRekordboxExport ? " *" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field-row">
+                  <label>FFmpeg</label>
+                  <span className="value">
+                    {ffmpeg.state === "ok"
+                      ? "Ready"
+                      : ffmpeg.state === "checking"
+                        ? "…"
+                        : "Missing"}
+                  </span>
+                </div>
+                <div className="field-row">
+                  <label>Export</label>
+                  <span className="value">
+                    {scanState.state === "ready"
+                      ? `${scanState.scan.totalTracks} tracks · ${scanState.scan.flacCount} FLAC · ${scanState.scan.mp3Count} MP3`
+                      : scanState.state === "scanning"
+                        ? "Scanning…"
+                        : scanState.state === "error"
+                          ? scanState.message
+                          : "—"}
+                  </span>
+                </div>
+              </fieldset>
+
+              <fieldset>
+                <legend>Convert</legend>
+                <div className="field-row stacked-control">
+                  <label htmlFor="playlist">Scope</label>
+                  <select
+                    id="playlist"
+                    value={playlistSelect}
+                    disabled={busy || scanState.state !== "ready"}
+                    onChange={(e) => setPlaylistSelect(e.target.value)}
+                  >
+                    <option value={PLAYLIST_ALL}>
+                      All FLACs
+                      {scanState.state === "ready"
+                        ? ` (${scanState.scan.flacCount})`
+                        : ""}
+                    </option>
+                    {playlists.map((p) => (
+                      <option key={p.id} value={String(p.id)}>
+                        {"\u00A0".repeat(p.depth * 2)}
+                        {p.name} ({p.flacCount} FLAC)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field-row">
+                  <label>Estimate</label>
+                  <span className="value">
+                    {scopeLoading ? "…" : scopeEstimate}
+                    {settings.dryRun ? " · dry-run" : ""}
+                    {settings.keepFlac ? " · keep FLAC" : ""}
+                  </span>
+                </div>
+              </fieldset>
+
+              {(busy || resultText) && (
+                <fieldset>
+                  <legend>Progress</legend>
+                  {busy && (
+                    <div className="progress-indicator">
+                      <span
+                        className="progress-indicator-bar"
+                        style={{ width: `${progressPct}%` }}
+                      />
+                    </div>
+                  )}
+                  {resultText && <p className="result-text">{resultText}</p>}
+                </fieldset>
+              )}
+
+              <div className="button-row">
+                <button
+                  type="button"
+                  disabled={!canConvert}
+                  onClick={startConvert}
+                >
+                  {converting ? "Cache…" : "Cache"}
+                </button>
+                <button
+                  type="button"
+                  disabled={!canConvert}
+                  onClick={startStagedCopy}
+                >
+                  {staging ? "Copy…" : "Staged"}
+                </button>
+                <button
+                  type="button"
+                  className="default"
+                  disabled={!canConvert}
+                  onClick={startInPlace}
+                >
+                  {inplace
+                    ? "USB…"
+                    : settings.dryRun
+                      ? "Dry run"
+                      : "Convert USB"}
+                </button>
+                <button
+                  type="button"
+                  disabled={!canInspect}
+                  onClick={loadInspect}
+                >
+                  Inspect
+                </button>
+              </div>
+            </>
           )}
-          {ffmpeg.state === "ok" && (
-            <span className="status-value ok" title={ffmpeg.version}>
-              ✔ ready
-            </span>
+
+          {tab === "inspect" && (
+            <>
+              {inspectState.state === "idle" && (
+                <p>Select a USB on Convert, then click Inspect.</p>
+              )}
+              {inspectState.state === "loading" && <p>Reading export.pdb…</p>}
+              {inspectState.state === "error" && (
+                <p className="error-text">{inspectState.message}</p>
+              )}
+              {inspectState.state === "ready" && (
+                <>
+                  <fieldset>
+                    <legend>Summary</legend>
+                    <div className="field-row">
+                      <label>Tracks</label>
+                      <span className="value">
+                        {inspectState.data.summary.trackCount}
+                      </span>
+                    </div>
+                    <div className="field-row">
+                      <label>Playlists</label>
+                      <span className="value">
+                        {inspectState.data.summary.playlistCount}
+                      </span>
+                    </div>
+                    <div className="field-row">
+                      <label>FLAC in DB</label>
+                      <span className="value">
+                        {inspectState.data.summary.flacInDb}
+                      </span>
+                    </div>
+                    <div className="field-row">
+                      <label>Round-trip</label>
+                      <span className="value">
+                        {inspectState.data.roundtrip.rekordboxPdb
+                          .byteIdentical
+                          ? "byte-identical"
+                          : "differs"}
+                      </span>
+                    </div>
+                  </fieldset>
+                  <fieldset>
+                    <legend>Dump</legend>
+                    <div className="sunken-panel dump-panel">
+                      <pre>{inspectState.data.textDump}</pre>
+                    </div>
+                    <div className="button-row">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          navigator.clipboard.writeText(
+                            inspectState.data.textDump,
+                          )
+                        }
+                      >
+                        Copy
+                      </button>
+                      <button type="button" onClick={() => setTab("convert")}>
+                        Close
+                      </button>
+                    </div>
+                  </fieldset>
+                </>
+              )}
+            </>
           )}
-          {ffmpeg.state === "error" && (
-            <span className="status-value error" title={ffmpeg.message}>
-              ✘ not available
-            </span>
+
+          {tab === "settings" && (
+            <>
+              <fieldset>
+                <legend>Conversion</legend>
+                <div className="field-row">
+                  <label htmlFor="bitrate">MP3 bitrate</label>
+                  <select
+                    id="bitrate"
+                    value={settingsDraft.bitrate}
+                    onChange={(e) =>
+                      setSettingsDraft({
+                        ...settingsDraft,
+                        bitrate: e.target.value,
+                      })
+                    }
+                  >
+                    <option value="192k">192k</option>
+                    <option value="256k">256k</option>
+                    <option value="320k">320k</option>
+                  </select>
+                </div>
+                <div className="field-row">
+                  <label htmlFor="workers">FFmpeg threads</label>
+                  <select
+                    id="workers"
+                    value={String(settingsDraft.workers)}
+                    onChange={(e) =>
+                      setSettingsDraft({
+                        ...settingsDraft,
+                        workers: Number(e.target.value),
+                      })
+                    }
+                  >
+                    <option value="0">Auto</option>
+                    {[1, 2, 3, 4, 6, 8].map((n) => (
+                      <option key={n} value={String(n)}>
+                        {n}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field-row stacked-control">
+                  <label htmlFor="cache">Cache location</label>
+                  <input
+                    id="cache"
+                    type="text"
+                    value={settingsDraft.cacheRoot}
+                    placeholder={defaultCacheRoot || "Default"}
+                    onChange={(e) =>
+                      setSettingsDraft({
+                        ...settingsDraft,
+                        cacheRoot: e.target.value,
+                      })
+                    }
+                  />
+                </div>
+              </fieldset>
+
+              <fieldset>
+                <legend>USB safety</legend>
+                <div className="field-row">
+                  <input
+                    checked={settingsDraft.keepFlac}
+                    type="checkbox"
+                    id="keepFlac"
+                    onChange={(e) =>
+                      setSettingsDraft({
+                        ...settingsDraft,
+                        keepFlac: e.target.checked,
+                      })
+                    }
+                  />
+                  <label htmlFor="keepFlac">Keep FLAC on USB</label>
+                </div>
+                <div className="field-row">
+                  <input
+                    checked={settingsDraft.verifyOutput}
+                    type="checkbox"
+                    id="verify"
+                    onChange={(e) =>
+                      setSettingsDraft({
+                        ...settingsDraft,
+                        verifyOutput: e.target.checked,
+                      })
+                    }
+                  />
+                  <label htmlFor="verify">Verify output before delete</label>
+                </div>
+                <div className="field-row">
+                  <input
+                    checked={settingsDraft.dryRun}
+                    type="checkbox"
+                    id="dryRun"
+                    onChange={(e) =>
+                      setSettingsDraft({
+                        ...settingsDraft,
+                        dryRun: e.target.checked,
+                      })
+                    }
+                  />
+                  <label htmlFor="dryRun">Dry run (no USB writes)</label>
+                </div>
+              </fieldset>
+
+              {stagedParent && (
+                <p className="hint">Staged copies: {stagedParent}</p>
+              )}
+              {settingsMsg && <p className="hint">{settingsMsg}</p>}
+
+              <div className="button-row">
+                <button type="button" className="default" onClick={saveSettings}>
+                  OK
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSettingsDraft(settings);
+                    setSettingsMsg("");
+                    setTab("convert");
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </>
           )}
         </div>
-        <div className="status-row">
-          <span className="status-label">USB</span>
-          {!selectedRoot && (
-            <span className="status-value muted">waiting for drive…</span>
-          )}
-          {selectedRoot && selected?.isRekordboxExport && (
-            <span className="status-value ok">✔ USB detected</span>
-          )}
-          {selectedRoot && selected && !selected.isRekordboxExport && (
-            <span className="status-value error">
-              ✘ no export.pdb on this drive
-            </span>
-          )}
-        </div>
-      </section>
+      </div>
 
-      <section className="card">
-        <h2>Export</h2>
-        {scanState.state === "idle" && (
-          <p className="muted empty">Select a USB to inspect.</p>
-        )}
-        {scanState.state === "scanning" && (
-          <p className="muted empty">Scanning…</p>
-        )}
-        {scanState.state === "error" && (
-          <p className="status-value error">{scanState.message}</p>
-        )}
-        {scanState.state === "ready" && (
-          <div className="stats">
-            <div className="stat">
-              <span className="stat-value">{scanState.scan.totalTracks}</span>
-              <span className="stat-label">tracks</span>
-            </div>
-            <div className="stat">
-              <span className="stat-value accent">
-                {scanState.scan.flacCount}
-              </span>
-              <span className="stat-label">FLAC</span>
-            </div>
-            <div className="stat">
-              <span className="stat-value">{scanState.scan.mp3Count}</span>
-              <span className="stat-label">MP3</span>
-            </div>
-          </div>
-        )}
-      </section>
-
-      <section className="card">
-        <h2>Convert scope</h2>
-        <select
-          className="drive-select"
-          value={playlistSelect}
-          onChange={(e) => setPlaylistSelect(e.target.value)}
-          aria-label="Playlist"
-            disabled={
-            busy ||
-            scanState.state !== "ready" ||
-            !selected?.isRekordboxExport
-          }
-        >
-          <option value={PLAYLIST_ALL}>
-            All FLACs on USB
-            {scanState.state === "ready"
-              ? ` (${scanState.scan.flacCount})`
-              : ""}
-          </option>
-          {playlists.map((p) => (
-            <option key={p.id} value={String(p.id)}>
-              {"\u00A0".repeat(p.depth * 2)}
-              {p.name} — {p.flacCount} FLAC / {p.trackCount} tracks
-            </option>
-          ))}
-        </select>
-        <p className="hint muted" style={{ marginTop: 10 }}>
-          Only tracks in the selected playlist are converted. Phase 4+ will
-          replace only those on the USB.
-        </p>
-      </section>
-
-      <section className="card">
-        <h2>Estimated conversion</h2>
-        <p className="estimate">
-          {scopeLoading
-            ? "…"
-            : scanState.state === "ready"
-              ? scopeEstimate
-              : "—"}
-        </p>
-        {scope && playlistSelect !== PLAYLIST_ALL && (
-          <p className="hint muted" style={{ marginBottom: 12 }}>
-            {scope.playlistName}: {scope.flacCount} FLAC
-            {scope.flacCount === 1 ? "" : "s"}
-          </p>
-        )}
-        <button
-          className="convert-btn"
-          disabled={!canConvert}
-          type="button"
-          onClick={startConvert}
-        >
-          {converting ? "Converting…" : "Convert to cache"}
-        </button>
-        <button
-          className="convert-btn staged-btn"
-          disabled={!canConvert}
-          type="button"
-          onClick={startStagedCopy}
-        >
-          {staging ? "Building copy…" : "Create converted copy"}
-        </button>
-        <button
-          className="secondary-btn"
-          disabled={!canInspect}
-          type="button"
-          onClick={loadInspect}
-        >
-          Inspect database
-        </button>
-        <p className="hint muted">
-          Cache warms MP3s only. <strong>Create converted copy</strong> writes a
-          full staged export (DB + ANLZ rewritten) under a new folder — your USB
-          is never touched.
-          {cacheRoot && (
-            <>
-              <br />
-              Cache: {cacheRoot}
-            </>
-          )}
-          {stagedParent && (
-            <>
-              <br />
-              Staged copies: {stagedParent}
-            </>
-          )}
-        </p>
-      </section>
-
-      {(convertState.state === "running" ||
-        convertState.state === "done" ||
-        convertState.state === "error") && (
-        <section className="card">
-          <h2>Progress</h2>
-          <div className="progress-bar" aria-valuenow={progressPct}>
-            <div
-              className="progress-fill"
-              style={{ width: `${progressPct}%` }}
-            />
-          </div>
-          {convertState.state === "running" && convertState.progress && (
-            <>
-              <p className="progress-label">
-                Track {convertState.progress.completed} /{" "}
-                {convertState.progress.total}
-              </p>
-              <p className="progress-file">
-                {convertState.progress.outcome === "cacheHit"
-                  ? "Cache hit: "
-                  : convertState.progress.outcome === "failed"
-                    ? "Failed: "
-                    : "Converting: "}
-                {convertState.progress.currentFile}
-              </p>
-              <p className="hint muted">
-                hits {convertState.progress.cacheHits} · converted{" "}
-                {convertState.progress.converted} · failed{" "}
-                {convertState.progress.failed}
-              </p>
-            </>
-          )}
-          {convertState.state === "running" && !convertState.progress && (
-            <p className="muted empty">Starting…</p>
-          )}
-          {convertState.state === "done" && (
-            <>
-              <p className="status-value ok">
-                ✔ Done — {convertState.summary.converted} converted,{" "}
-                {convertState.summary.cacheHits} cache hits
-                {convertState.summary.failed > 0 &&
-                  `, ${convertState.summary.failed} failed`}
-              </p>
-              <p className="hint muted">
-                Cache: {convertState.summary.cacheRoot}
-              </p>
-              {convertState.summary.errors.length > 0 && (
-                <pre className="text-dump">
-                  {convertState.summary.errors.join("\n")}
-                </pre>
-              )}
-            </>
-          )}
-          {convertState.state === "error" && (
-            <p className="status-value error">{convertState.message}</p>
-          )}
-        </section>
-      )}
-
-      {(pipelineState.state === "running" ||
-        pipelineState.state === "done" ||
-        pipelineState.state === "error") && (
-        <section className="card">
-          <h2>Staged copy</h2>
-          {pipelineState.state === "running" && pipelineState.progress && (
-            <>
-              <p className="progress-label">
-                {pipelineState.progress.phase}
-                {pipelineState.progress.total > 0 &&
-                  ` — ${pipelineState.progress.completed}/${pipelineState.progress.total}`}
-              </p>
-              <p className="progress-file">{pipelineState.progress.detail}</p>
-            </>
-          )}
-          {pipelineState.state === "running" && !pipelineState.progress && (
-            <p className="muted empty">Starting…</p>
-          )}
-          {pipelineState.state === "done" && (
-            <>
-              <p className="status-value ok">
-                ✔ Copy ready — {pipelineState.summary.pdbUpdated} DB tracks,{" "}
-                {pipelineState.summary.anlzUpdated} ANLZ files,{" "}
-                {pipelineState.summary.flacsRemoved} FLACs removed from copy
-              </p>
-              <p className="hint muted">
-                Output: {pipelineState.summary.outputRoot}
-              </p>
-              <p className="hint muted">
-                Copy this folder onto a spare USB (as the drive root) and test in
-                Rekordbox / on your CDJs.
-              </p>
-              {pipelineState.summary.verifyProblems.length > 0 && (
-                <pre className="text-dump">
-                  Verify:{"\n"}
-                  {pipelineState.summary.verifyProblems.join("\n")}
-                </pre>
-              )}
-              {pipelineState.summary.errors.length > 0 && (
-                <pre className="text-dump">
-                  {pipelineState.summary.errors.join("\n")}
-                </pre>
-              )}
-            </>
-          )}
-          {pipelineState.state === "error" && (
-            <p className="status-value error">{pipelineState.message}</p>
-          )}
-        </section>
-      )}
-
-      <footer className="footer">
-        Phase 4 — staged converted copy (USB untouched)
-      </footer>
-    </main>
+      <div className="status-bar">
+        <p className="status-bar-field">{statusLine}</p>
+        <p className="status-bar-field">v{appVersion}</p>
+      </div>
+    </div>
   );
 }

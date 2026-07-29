@@ -17,17 +17,30 @@ before the next begins:
 - [x] Phase 2 — Pioneer database reading and round-trip proof
 - [x] Phase 3 — FLAC→MP3 conversion engine and cache
 - [x] Phase 4 — Database and ANLZ rewriting (on a copy)
-- [ ] Phase 5 — Full transactional pipeline on the USB
-- [ ] Phase 6 — Settings, tests, polish
+- [x] Phase 5 — Full transactional pipeline on the USB
+- [x] Phase 6 — Settings, tests, polish (Win98 compact UI)
 
 ## Architecture
 
 - `core/` — pure Rust engine (`rbusb-core`): USB detection, export scanner,
-  PDB/ANLZ read+rewrite, FFmpeg wrapper, cache, transactional pipeline.
+  PDB/ANLZ read+rewrite, FFmpeg wrapper, cache, settings, transactional pipeline.
   No UI dependencies; each module is documented in its source file.
 - `src-tauri/` — Tauri 2 shell exposing the engine as commands/events, and
   bundling `ffmpeg`/`ffprobe` as sidecar binaries.
-- `src/` — React + TypeScript frontend (Vite).
+- `src/` — React + TypeScript frontend (Vite) styled with [98.css](https://jdan.github.io/98.css/).
+
+## Settings
+
+Stored at `%LOCALAPPDATA%\RekordboxUsbConverter\settings.json`:
+
+| Setting | Default | Notes |
+|---------|---------|--------|
+| MP3 bitrate | `320k` | Also `192k` / `256k` |
+| FFmpeg threads | Auto | 1–8 |
+| Cache location | `%LOCALAPPDATA%\…\Cache` | Empty = default |
+| Keep FLAC on USB | off | Skip deletion after in-place convert |
+| Verify output | on | Rollback if post-rewrite checks fail |
+| Dry run | off | Plan only — no USB writes |
 
 ## Prerequisites (Windows)
 
