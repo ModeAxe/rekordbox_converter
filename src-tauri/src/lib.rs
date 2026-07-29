@@ -1,4 +1,4 @@
-//! Tauri shell for the Rekordbox USB converter.
+//! Tauri shell for the DrokerBox USB converter.
 //!
 //! This crate is a thin adapter: every command delegates to `rbusb-core`
 //! or to the bundled FFmpeg sidecar. No business logic lives here.
