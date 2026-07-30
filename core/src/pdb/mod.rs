@@ -5,7 +5,6 @@
 //! [Deep Symmetry](https://djl-analysis.deepsymmetry.org/rekordbox-export-analysis/exports.html)).
 //! [`roundtrip`] records the comparison against `rekordcrate`.
 //!
-//! Surgical rewriting (Phase 4) goes through `rekordbox_pdb::PdbEditor`.
 
 mod inspect;
 mod playlists;
