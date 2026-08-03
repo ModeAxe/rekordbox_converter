@@ -1,8 +1,8 @@
 //! FFmpeg wrapper and conversion queue.
 //!
-//! Spawns the bundled `ffmpeg` sidecar to transcode FLAC → MP3 (default
-//! 320 kbps CBR, `-map_metadata 0 -id3v2_version 3`, artwork stream copied)
-//! and runs a multi-threaded worker pool with per-track progress reporting.
+//! Spawns the bundled `ffmpeg` sidecar to transcode non-MP3 audio → MP3
+//! (default 320 kbps CBR, `-map_metadata 0 -id3v2_version 3`, artwork stream
+//! copied) and runs a multi-threaded worker pool with per-track progress.
 //!
 //! The path to the ffmpeg executable is injected by the caller so this
 //! module stays free of Tauri dependencies.
@@ -87,11 +87,11 @@ pub struct ConvertSummary {
     pub errors: Vec<String>,
 }
 
-/// Converts (or cache-copies) every FLAC into the cache. Never writes to the USB.
+/// Converts (or cache-copies) every source into the cache. Never writes to the USB.
 ///
 /// `on_progress` is called after each track (may be called from worker threads).
 pub fn convert_to_cache<F>(
-    flac_paths: &[PathBuf],
+    source_paths: &[PathBuf],
     options: &ConvertOptions,
     cancel: Option<Arc<AtomicBool>>,
     mut on_progress: F,
@@ -99,7 +99,7 @@ pub fn convert_to_cache<F>(
 where
     F: FnMut(ConvertProgress) + Send,
 {
-    if flac_paths.is_empty() {
+    if source_paths.is_empty() {
         return Ok(ConvertSummary {
             total: 0,
             cache_hits: 0,
@@ -113,7 +113,7 @@ where
     let cache = CacheManager::new(&options.cache_root);
     cache.ensure_root()?;
 
-    let total = flac_paths.len() as u32;
+    let total = source_paths.len() as u32;
     let completed = AtomicU32::new(0);
     let cache_hits = AtomicU32::new(0);
     let converted = AtomicU32::new(0);
@@ -131,7 +131,7 @@ where
     let bitrate = &options.bitrate;
 
     pool.install(|| {
-        flac_paths.par_iter().for_each(|flac| {
+        source_paths.par_iter().for_each(|source| {
             if cancel
                 .as_ref()
                 .is_some_and(|c| c.load(Ordering::Relaxed))
@@ -139,12 +139,12 @@ where
                 return;
             }
 
-            let display_name = flac
+            let display_name = source
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| flac.display().to_string());
+                .unwrap_or_else(|| source.display().to_string());
 
-            let result = process_one(flac, contents, &cache, ffmpeg, bitrate);
+            let result = process_one(source, contents, &cache, ffmpeg, bitrate);
 
             let (outcome, cache_path, error) = match result {
                 Ok((ConvertOutcome::CacheHit, path)) => {
@@ -195,18 +195,18 @@ where
 }
 
 fn process_one(
-    flac: &Path,
+    source: &Path,
     contents: Option<&Path>,
     cache: &CacheManager,
     ffmpeg: &Path,
     bitrate: &str,
 ) -> Result<(ConvertOutcome, PathBuf)> {
-    if let Some(hit) = cache.lookup(flac, contents)? {
+    if let Some(hit) = cache.lookup(source, contents)? {
         return Ok((ConvertOutcome::CacheHit, hit));
     }
 
-    let key = cache::compute_key(flac)?;
-    let dest = cache.cache_path_for(flac, contents);
+    let key = cache::compute_key(source)?;
+    let dest = cache.cache_path_for(source, contents);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -223,13 +223,13 @@ fn process_one(
         let _ = std::fs::remove_file(&tmp);
     }
 
-    run_ffmpeg(ffmpeg, flac, &tmp, bitrate)?;
+    run_ffmpeg(ffmpeg, source, &tmp, bitrate)?;
 
     if !tmp.is_file() || std::fs::metadata(&tmp)?.len() == 0 {
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::Message(format!(
             "ffmpeg produced empty output for {}",
-            flac.display()
+            source.display()
         )));
     }
 
@@ -246,7 +246,7 @@ fn process_one(
 /// Runs FFmpeg with the project-standard flags, plus artwork stream copy.
 ///
 /// ```text
-/// ffmpeg -y -i input.flac \
+/// ffmpeg -y -i input.wav \
 ///   -map 0:a:0 -map 0:v? \
 ///   -codec:a libmp3lame -b:a 320k \
 ///   -codec:v copy \

@@ -98,7 +98,7 @@ fn convert_to_cache(
 ) -> Result<ConvertSummary, String> {
     let cfg = settings::load();
     let scope = resolve_convert_scope(&root, playlist_id).map_err(|e| e.to_string())?;
-    if scope.flac_paths.is_empty() {
+    if scope.convertible_paths.is_empty() {
         return Ok(ConvertSummary {
             total: 0,
             cache_hits: 0,
@@ -137,11 +137,11 @@ fn convert_to_cache(
         contents_root: contents,
     };
 
-    let flacs: Vec<PathBuf> = scope.flac_paths.iter().map(PathBuf::from).collect();
+    let sources: Vec<PathBuf> = scope.convertible_paths.iter().map(PathBuf::from).collect();
     let app_for_progress = app.clone();
 
     let summary = convert::convert_to_cache(
-        &flacs,
+        &sources,
         &options,
         Some(Arc::clone(&cancel)),
         move |progress: ConvertProgress| {
@@ -270,7 +270,7 @@ fn convert_usb_inplace(
         cache_root: cfg.resolved_cache_root(),
         bitrate: cfg.bitrate.clone(),
         workers: cfg.resolved_workers(),
-        keep_flac: cfg.keep_flac,
+        keep_source: cfg.keep_source,
         verify_output: cfg.verify_output,
         dry_run: cfg.dry_run,
     };

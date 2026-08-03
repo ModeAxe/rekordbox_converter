@@ -7,6 +7,7 @@ use rekordbox_pdb::Database;
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+use crate::formats::{self, estimate_seconds};
 use crate::scanner::export_pdb_path;
 
 /// A convertible playlist (folders are excluded).
@@ -18,24 +19,25 @@ pub struct PlaylistOption {
     /// Indentation hint from the playlist tree (0 = root).
     pub depth: u32,
     pub track_count: u32,
-    pub flac_count: u32,
+    /// Non-MP3 audio tracks that would be converted.
+    pub convertible_count: u32,
     pub mp3_count: u32,
     pub other_count: u32,
 }
 
-/// Result of resolving which FLAC files to convert for a scope.
+/// Result of resolving which non-MP3 files to convert for a scope.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConvertScope {
-    /// `None` means all FLACs on the stick.
+    /// `None` means all convertible files on the stick.
     pub playlist_id: Option<u32>,
     pub playlist_name: Option<String>,
-    pub flac_paths: Vec<String>,
-    pub flac_count: u32,
+    pub convertible_paths: Vec<String>,
+    pub convertible_count: u32,
     pub estimated_seconds: u32,
 }
 
-/// Lists non-folder playlists with FLAC/MP3 counts for the UI picker.
+/// Lists non-folder playlists with convertible/MP3 counts for the UI picker.
 pub fn list_playlists(root: impl AsRef<Path>) -> Result<Vec<PlaylistOption>> {
     let root = root.as_ref();
     let db = load_db(root)?;
@@ -44,11 +46,7 @@ pub fn list_playlists(root: impl AsRef<Path>) -> Result<Vec<PlaylistOption>> {
         .tracks
         .iter()
         .map(|t| {
-            let ext = PathBuf::from(t.file_path())
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let ext = formats::extension_of(PathBuf::from(t.file_path()));
             (t.id, ext)
         })
         .collect();
@@ -72,14 +70,17 @@ pub fn list_playlists(root: impl AsRef<Path>) -> Result<Vec<PlaylistOption>> {
                 .get(&node.id)
                 .cloned()
                 .unwrap_or_default();
-            let mut flac_count = 0u32;
+            let mut convertible_count = 0u32;
             let mut mp3_count = 0u32;
             let mut other_count = 0u32;
             for tid in &track_ids {
-                match track_ext.get(tid).map(|s| s.as_str()).unwrap_or("") {
-                    "flac" => flac_count += 1,
-                    "mp3" => mp3_count += 1,
-                    _ => other_count += 1,
+                let ext = track_ext.get(tid).map(|s| s.as_str()).unwrap_or("");
+                if formats::is_mp3(ext) {
+                    mp3_count += 1;
+                } else if formats::is_convertible(ext) {
+                    convertible_count += 1;
+                } else if !ext.is_empty() {
+                    other_count += 1;
                 }
             }
             PlaylistOption {
@@ -87,7 +88,7 @@ pub fn list_playlists(root: impl AsRef<Path>) -> Result<Vec<PlaylistOption>> {
                 name: node.name.clone(),
                 depth: depth_map.get(&node.id).copied().unwrap_or(0),
                 track_count: track_ids.len() as u32,
-                flac_count,
+                convertible_count,
                 mp3_count,
                 other_count,
             }
@@ -103,7 +104,7 @@ pub fn list_playlists(root: impl AsRef<Path>) -> Result<Vec<PlaylistOption>> {
     Ok(options)
 }
 
-/// Resolves absolute FLAC paths for `playlist_id`, or all FLACs if `None`.
+/// Resolves absolute convertible paths for `playlist_id`, or all if `None`.
 pub fn resolve_convert_scope(
     root: impl AsRef<Path>,
     playlist_id: Option<u32>,
@@ -129,45 +130,41 @@ pub fn resolve_convert_scope(
         }
     };
 
-    let mut flac_paths = Vec::new();
-    let mut flac_bytes = 0u64;
+    let mut convertible_paths = Vec::new();
+    let mut convertible_bytes = 0u64;
 
     for track in &db.tracks {
         if !track_ids.contains(&track.id) {
             continue;
         }
         let path_in_db = track.file_path();
-        let ext = PathBuf::from(path_in_db)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext != "flac" {
+        let ext = formats::extension_of(PathBuf::from(path_in_db));
+        if !formats::is_convertible(&ext) {
             continue;
         }
         let abs = resolve_usb_path(root, path_in_db);
         if abs.is_file() {
             if let Ok(meta) = abs.metadata() {
-                flac_bytes += meta.len();
+                convertible_bytes += meta.len();
             }
-            flac_paths.push(abs.display().to_string());
+            convertible_paths.push(abs.display().to_string());
         } else {
             // Still list it so the UI can show a failure later if needed.
-            flac_paths.push(abs.display().to_string());
+            convertible_paths.push(abs.display().to_string());
         }
     }
 
-    flac_paths.sort();
-    flac_paths.dedup();
+    convertible_paths.sort();
+    convertible_paths.dedup();
 
-    let flac_count = flac_paths.len() as u32;
-    let estimated_seconds = estimate_seconds(flac_bytes, flac_count);
+    let convertible_count = convertible_paths.len() as u32;
+    let estimated_seconds = estimate_seconds(convertible_bytes, convertible_count);
 
     Ok(ConvertScope {
         playlist_id,
         playlist_name,
-        flac_paths,
-        flac_count,
+        convertible_paths,
+        convertible_count,
         estimated_seconds,
     })
 }
@@ -213,17 +210,6 @@ fn playlist_depths(db: &Database) -> HashMap<u32, u32> {
         depths.insert(node.id, depth);
     }
     depths
-}
-
-fn estimate_seconds(flac_bytes: u64, flac_count: u32) -> u32 {
-    if flac_count == 0 {
-        return 0;
-    }
-    const SECONDS_PER_MB_FLAC: f64 = 0.35;
-    let mb = flac_bytes as f64 / (1024.0 * 1024.0);
-    let from_size = (mb * SECONDS_PER_MB_FLAC).ceil() as u32;
-    let from_count = flac_count.saturating_mul(2);
-    from_size.max(from_count)
 }
 
 #[cfg(test)]

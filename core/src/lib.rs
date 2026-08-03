@@ -1,6 +1,6 @@
 //! # rbusb-core
 //!
-//! Core engine for the Rekordbox USB FLAC→MP3 converter.
+//! Core engine for the Rekordbox USB non-MP3→MP3 converter.
 //!
 //! This crate contains all business logic and is deliberately free of any
 //! UI-framework dependency (no Tauri imports). The Tauri shell in
@@ -13,6 +13,7 @@
 //! |--------------|-----------------------------------------------------------------------|
 //! | [`usb`]      | Enumerate removable drives and watch for insertion/removal (Windows)  |
 //! | [`scanner`]  | Validate a drive as a Rekordbox export and inventory its audio files  |
+//! | [`formats`]  | Which extensions are convertible vs MP3 passthrough                   |
 //! | [`pdb`]      | Read and surgically rewrite `export.pdb` / `exportExt.pdb`            |
 //! | [`anlz`]     | Read and rewrite ANLZ analysis files (`.DAT`/`.EXT`/`.2EX`, PPTH tag) |
 //! | [`convert`]  | FFmpeg wrapper and multi-threaded conversion queue                    |
@@ -24,6 +25,7 @@ pub mod anlz;
 pub mod cache;
 pub mod convert;
 pub mod error;
+pub mod formats;
 pub mod pdb;
 pub mod pipeline;
 pub mod scanner;

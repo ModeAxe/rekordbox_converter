@@ -21,9 +21,10 @@ pub struct AppSettings {
     pub cache_root: String,
     /// Parallel FFmpeg workers. `0` = auto (1–8 based on CPU).
     pub workers: u32,
-    /// Keep FLAC files on the USB after a successful in-place convert.
-    pub keep_flac: bool,
-    /// Re-verify the rewritten PDB before deleting FLACs.
+    /// Keep source files on the USB after a successful in-place convert.
+    #[serde(default, alias = "keepFlac")]
+    pub keep_source: bool,
+    /// Re-verify the rewritten PDB before deleting sources.
     pub verify_output: bool,
     /// Plan-only: resolve scope and report, do not write the USB.
     pub dry_run: bool,
@@ -35,7 +36,7 @@ impl Default for AppSettings {
             bitrate: "320k".into(),
             cache_root: String::new(),
             workers: 0,
-            keep_flac: false,
+            keep_source: false,
             verify_output: true,
             dry_run: false,
         }
@@ -127,5 +128,13 @@ mod tests {
         assert_eq!(back.bitrate, "320k");
         assert!(back.verify_output);
         assert!(!back.dry_run);
+        assert!(!back.keep_source);
+    }
+
+    #[test]
+    fn keep_source_alias_from_old_settings() {
+        let json = r#"{"bitrate":"320k","cacheRoot":"","workers":0,"keepFlac":true,"verifyOutput":true,"dryRun":false}"#;
+        let s: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(s.keep_source);
     }
 }

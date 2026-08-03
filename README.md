@@ -1,10 +1,12 @@
 # DrokerBox USB Converter
 
 A Windows desktop app that post-processes Rekordbox-exported USB drives:
-every FLAC on the stick is converted to 320 kbps MP3 and the Pioneer
-database (`export.pdb`) plus the ANLZ analysis files are rewritten so that
-all playlists, hot cues, memory cues, beatgrids, waveforms, artwork and
-metadata keep working on CDJ/XDJ players that cannot play FLAC.
+non-MP3 audio on the stick (FLAC, WAV, AIFF, M4A, …) is converted to 320 kbps
+MP3 and the Pioneer database (`export.pdb`) plus the ANLZ analysis files are
+rewritten so that all playlists, hot cues, memory cues, beatgrids, waveforms,
+artwork and metadata keep working on CDJ/XDJ players that cannot play those
+formats. Existing MP3s are left alone. The master Rekordbox library is never
+touched.
 
 ## Architecture
 
@@ -24,7 +26,7 @@ Stored at `%LOCALAPPDATA%\DrokerboxUsbConverter\settings.json`:
 | MP3 bitrate | `320k` | Also `192k` / `256k` |
 | FFmpeg threads | Auto | 1–8 |
 | Cache location | `%LOCALAPPDATA%\…\Cache` | Empty = default |
-| Keep FLAC on USB | off | Skip deletion after in-place convert |
+| Keep source files | off | Skip deletion after in-place convert |
 | Verify output | on | Rollback if post-rewrite checks fail |
 | Dry run | off | Plan only — no USB writes |
 

@@ -1,7 +1,7 @@
 //! Staged-copy pipeline (Phase 4) and in-place USB pipeline (Phase 5).
 //!
 //! Phase 4 builds a converted copy under a user-chosen output directory.
-//! Phase 5 converts on the live USB with backup + rollback before any FLAC
+//! Phase 5 converts on the live USB with backup + rollback before any source
 //! deletion.
 
 use std::fs;
@@ -45,7 +45,7 @@ pub struct StagedCopySummary {
     pub cache_hits: u32,
     pub pdb_updated: u32,
     pub anlz_updated: u32,
-    pub flacs_removed: u32,
+    pub sources_removed: u32,
     pub verify_problems: Vec<String>,
     pub errors: Vec<String>,
 }
@@ -66,10 +66,10 @@ pub struct StagedCopyOptions {
 ///
 /// Steps:
 /// 1. Create output dir; copy `PIONEER/` tree
-/// 2. Copy scoped FLAC files into `Contents/` (preserving relative paths)
-/// 3. Convert/copy-from-cache each FLAC → MP3 alongside it
+/// 2. Copy scoped convertible files into `Contents/` (preserving relative paths)
+/// 3. Convert/copy-from-cache each source → MP3 alongside it
 /// 4. Rewrite `export.pdb` track rows + ANLZ `PPTH` tags
-/// 5. Verify; delete FLACs from the copy
+/// 5. Verify; delete sources from the copy
 ///
 /// The source USB is never written.
 pub fn build_staged_copy<F>(
@@ -88,9 +88,9 @@ where
     }
 
     let scope = resolve_convert_scope(src, options.playlist_id)?;
-    if scope.flac_paths.is_empty() {
+    if scope.convertible_paths.is_empty() {
         return Err(Error::Message(
-            "no FLAC tracks in the selected scope".into(),
+            "no convertible tracks in the selected scope".into(),
         ));
     }
 
@@ -100,8 +100,8 @@ where
     let expected_tracks = src_db.tracks.len();
     let expected_entries = src_db.playlist_entries.len();
 
-    // Map scoped FLACs → track rows for rewrite.
-    let scope_paths: Vec<PathBuf> = scope.flac_paths.iter().map(PathBuf::from).collect();
+    // Map scoped sources → track rows for rewrite.
+    let scope_paths: Vec<PathBuf> = scope.convertible_paths.iter().map(PathBuf::from).collect();
     let mut track_rows: Vec<&rekordbox_pdb::Track> = Vec::new();
     for t in &src_db.tracks {
         let abs = resolve_usb_path(src, t.file_path());
@@ -144,31 +144,31 @@ where
     }
     check_cancel(&cancel)?;
 
-    // 2. Copy scoped FLACs
-    let total_flacs = scope.flac_paths.len() as u32;
+    // 2. Copy scoped convertible sources
+    let total_sources = scope.convertible_paths.len() as u32;
     let mut copied = 0u32;
-    for flac in &scope.flac_paths {
+    for src_path in &scope.convertible_paths {
         check_cancel(&cancel)?;
-        let src_flac = PathBuf::from(flac);
-        let rel = relative_contents_path(src, &src_flac);
-        let dest_flac = out.join(&rel);
-        if let Some(parent) = dest_flac.parent() {
+        let src_file = PathBuf::from(src_path);
+        let rel = relative_contents_path(src, &src_file);
+        let dest_file = out.join(&rel);
+        if let Some(parent) = dest_file.parent() {
             fs::create_dir_all(parent)?;
         }
-        if src_flac.is_file() {
-            fs::copy(&src_flac, &dest_flac)?;
+        if src_file.is_file() {
+            fs::copy(&src_file, &dest_file)?;
         }
         copied += 1;
         emit(
             &mut on_progress,
             "copy-audio",
             copied,
-            total_flacs,
-            format!("Copied {}", file_name(&src_flac)),
+            total_sources,
+            format!("Copied {}", file_name(&src_file)),
         );
     }
 
-    // 3. Convert each FLAC on the copy (prefer cache).
+    // 3. Convert each source on the copy (prefer cache).
     let contents_out = {
         let c = out.join("Contents");
         if c.is_dir() {
@@ -188,8 +188,8 @@ where
         contents_root: contents_out.clone(),
     };
 
-    let out_flacs: Vec<PathBuf> = scope
-        .flac_paths
+    let out_sources: Vec<PathBuf> = scope
+        .convertible_paths
         .iter()
         .map(|p| out.join(relative_contents_path(src, Path::new(p))))
         .filter(|p| p.is_file())
@@ -199,20 +199,20 @@ where
     let mut converted = 0u32;
     let mut errors = Vec::new();
     let done = AtomicU32::new(0);
-    let total = out_flacs.len() as u32;
+    let total = out_sources.len() as u32;
 
     // Sequential for simpler path pairing with DB rewrite; conversion itself
     // uses the cache so repeats are cheap. Parallel convert_to_cache already
     // exists for cache warm-up (Phase 3).
-    for flac in &out_flacs {
+    for source in &out_sources {
         check_cancel(&cancel)?;
-        let name = file_name(flac);
+        let name = file_name(source);
         // Cache was warmed from the source USB paths in Phase 3 — look up by source.
-        let src_flac = src.join(relative_contents_path(out, flac));
-        let cache_flac = if src_flac.is_file() {
-            src_flac.as_path()
+        let src_file = src.join(relative_contents_path(out, source));
+        let cache_source = if src_file.is_file() {
+            src_file.as_path()
         } else {
-            flac.as_path()
+            source.as_path()
         };
         let src_contents = {
             let c = src.join("Contents");
@@ -222,9 +222,9 @@ where
                 None
             }
         };
-        match place_mp3_beside_flac(
-            flac,
-            cache_flac,
+        match place_mp3_beside_source(
+            source,
+            cache_source,
             src_contents.as_deref(),
             &cache,
             &convert_opts,
@@ -248,9 +248,9 @@ where
     let mut rewrites = Vec::new();
     let mut rewritten_ids = Vec::new();
     for track in &track_rows {
-        let src_flac = resolve_usb_path(src, track.file_path());
-        let out_flac = out.join(relative_contents_path(src, &src_flac));
-        let out_mp3 = out_flac.with_extension("mp3");
+        let src_file = resolve_usb_path(src, track.file_path());
+        let out_file = out.join(relative_contents_path(src, &src_file));
+        let out_mp3 = crate::formats::to_mp3_path(&out_file);
         if !out_mp3.is_file() {
             errors.push(format!(
                 "MP3 missing after convert: {}",
@@ -259,7 +259,7 @@ where
             continue;
         }
         let file_size = out_mp3.metadata().map(|m| m.len() as u32).unwrap_or(0);
-        let new_db_path = db_path_flac_to_mp3(track.file_path());
+        let new_db_path = crate::formats::db_path_to_mp3(track.file_path());
         let new_filename = PathBuf::from(&new_db_path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -324,14 +324,14 @@ where
         errors.push("exportExt.pdb missing from staged copy".into());
     }
 
-    // 7. Delete FLACs from the copy (only after verify of MP3s exists).
-    let mut flacs_removed = 0u32;
+    // 7. Delete sources from the copy (only after verify of MP3s exists).
+    let mut sources_removed = 0u32;
     if verify_problems.is_empty() {
-        for flac in &out_flacs {
-            let mp3 = flac.with_extension("mp3");
+        for source in &out_sources {
+            let mp3 = crate::formats::to_mp3_path(source);
             if mp3.is_file() {
-                let _ = fs::remove_file(flac);
-                flacs_removed += 1;
+                let _ = fs::remove_file(source);
+                sources_removed += 1;
             }
         }
     }
@@ -350,7 +350,7 @@ where
         cache_hits,
         pdb_updated: pdb_summary.updated,
         anlz_updated,
-        flacs_removed,
+        sources_removed,
         verify_problems,
         errors,
     })
@@ -361,24 +361,24 @@ enum ConvertPlace {
     Converted,
 }
 
-fn place_mp3_beside_flac(
-    dest_flac: &Path,
-    cache_source_flac: &Path,
+fn place_mp3_beside_source(
+    dest_source: &Path,
+    cache_source: &Path,
     cache_contents: Option<&Path>,
     cache: &CacheManager,
     options: &ConvertOptions,
 ) -> Result<ConvertPlace> {
-    let dest_mp3 = dest_flac.with_extension("mp3");
+    let dest_mp3 = crate::formats::to_mp3_path(dest_source);
     if dest_mp3.is_file() && dest_mp3.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
         return Ok(ConvertPlace::CacheHit);
     }
 
-    if let Some(hit) = cache.lookup(cache_source_flac, cache_contents)? {
+    if let Some(hit) = cache.lookup(cache_source, cache_contents)? {
         fs::copy(&hit, &dest_mp3)?;
         return Ok(ConvertPlace::CacheHit);
     }
 
-    let key = cache::compute_key(cache_source_flac)?;
+    let key = cache::compute_key(cache_source)?;
     let tmp = {
         let stem = dest_mp3
             .file_stem()
@@ -389,7 +389,7 @@ fn place_mp3_beside_flac(
     if tmp.exists() {
         let _ = fs::remove_file(&tmp);
     }
-    convert::run_ffmpeg(&options.ffmpeg_path, dest_flac, &tmp, &options.bitrate)?;
+    convert::run_ffmpeg(&options.ffmpeg_path, dest_source, &tmp, &options.bitrate)?;
     if !tmp.is_file() || tmp.metadata()?.len() == 0 {
         let _ = fs::remove_file(&tmp);
         return Err(Error::Message("ffmpeg produced empty output".into()));
@@ -400,7 +400,7 @@ fn place_mp3_beside_flac(
         Ok::<(), Error>(())
     })?;
 
-    let _ = cache.store_copy(cache_source_flac, cache_contents, &dest_mp3, &key);
+    let _ = cache.store_copy(cache_source, cache_contents, &dest_mp3, &key);
     Ok(ConvertPlace::Converted)
 }
 
@@ -412,20 +412,6 @@ fn relative_contents_path(usb_root: &Path, abs_file: &Path) -> PathBuf {
     PathBuf::from("Contents")
         .join("Unknown")
         .join(abs_file.file_name().unwrap_or_default())
-}
-
-fn db_path_flac_to_mp3(db_path: &str) -> String {
-    if let Some(stripped) = db_path
-        .strip_suffix(".flac")
-        .or_else(|| db_path.strip_suffix(".FLAC"))
-    {
-        format!("{stripped}.mp3")
-    } else {
-        let mut p = PathBuf::from(db_path);
-        p.set_extension("mp3");
-        // Keep forward slashes as DeviceSQL typically uses.
-        p.to_string_lossy().replace('\\', "/")
-    }
 }
 
 fn paths_loose_eq(a: &Path, b: &Path) -> bool {
@@ -493,7 +479,7 @@ pub fn default_staged_parent() -> PathBuf {
 // Phase 5 — in-place USB conversion with backup / rollback
 // ---------------------------------------------------------------------------
 
-/// Options for converting FLACs on the live USB.
+/// Options for converting non-MP3 audio on the live USB.
 #[derive(Debug, Clone)]
 pub struct InPlaceOptions {
     pub usb_root: PathBuf,
@@ -502,8 +488,8 @@ pub struct InPlaceOptions {
     pub cache_root: PathBuf,
     pub bitrate: String,
     pub workers: usize,
-    /// If true, keep FLACs on the USB after a successful conversion.
-    pub keep_flac: bool,
+    /// If true, keep source files on the USB after a successful conversion.
+    pub keep_source: bool,
     /// Fail the run if post-rewrite verify finds problems (triggers rollback).
     pub verify_output: bool,
     /// Resolve scope and report only — no USB writes.
@@ -519,7 +505,7 @@ pub struct InPlaceSummary {
     pub cache_hits: u32,
     pub pdb_updated: u32,
     pub anlz_updated: u32,
-    pub flacs_removed: u32,
+    pub sources_removed: u32,
     pub rolled_back: bool,
     pub backup_kept: bool,
     pub verify_problems: Vec<String>,
@@ -533,15 +519,15 @@ struct BackupManifest {
     files: Vec<String>,
 }
 
-/// Converts scoped FLACs on the live USB.
+/// Converts scoped non-MP3 audio on the live USB.
 ///
 /// Crash-safe order:
 /// 1. Backup `export.pdb`, `exportExt.pdb`, and affected ANLZ files
-/// 2. Write MP3s alongside FLACs (cache or FFmpeg)
+/// 2. Write MP3s alongside sources (cache or FFmpeg)
 /// 3. Verify every MP3
 /// 4. Rewrite DB + ANLZ
 /// 5. Re-verify
-/// 6. Delete FLACs (unless `keep_flac`)
+/// 6. Delete sources (unless `keep_source`)
 /// 7. Remove backup on success
 ///
 /// Any failure before step 6 restores the backed-up files.
@@ -559,9 +545,9 @@ where
     }
 
     let scope = resolve_convert_scope(root, options.playlist_id)?;
-    if scope.flac_paths.is_empty() {
+    if scope.convertible_paths.is_empty() {
         return Err(Error::Message(
-            "no FLAC tracks in the selected scope".into(),
+            "no convertible tracks in the selected scope".into(),
         ));
     }
 
@@ -570,7 +556,7 @@ where
     let expected_tracks = db.tracks.len();
     let expected_entries = db.playlist_entries.len();
 
-    let scope_paths: Vec<PathBuf> = scope.flac_paths.iter().map(PathBuf::from).collect();
+    let scope_paths: Vec<PathBuf> = scope.convertible_paths.iter().map(PathBuf::from).collect();
     let mut track_rows: Vec<&rekordbox_pdb::Track> = Vec::new();
     for t in &db.tracks {
         let abs = resolve_usb_path(root, t.file_path());
@@ -588,7 +574,7 @@ where
             0,
             1,
             format!(
-                "Dry run: would convert {} FLAC(s), rewrite {} track row(s)",
+                "Dry run: would convert {} source(s), rewrite {} track row(s)",
                 scope_paths.len(),
                 track_rows.len()
             ),
@@ -599,12 +585,12 @@ where
             cache_hits: 0,
             pdb_updated: 0,
             anlz_updated: 0,
-            flacs_removed: 0,
+            sources_removed: 0,
             rolled_back: false,
             backup_kept: false,
             verify_problems: Vec::new(),
             errors: vec![format!(
-                "dry run — no changes written ({} FLAC → MP3 @ {})",
+                "dry run — no changes written ({} source(s) → MP3 @ {})",
                 scope_paths.len(),
                 options.bitrate
             )],
@@ -633,7 +619,7 @@ where
     let mut cache_hits = 0u32;
     let mut converted = 0u32;
     let mut anlz_updated = 0u32;
-    let mut flacs_removed = 0u32;
+    let mut sources_removed = 0u32;
     let mut pdb_updated = 0u32;
     let mut rolled_back = false;
     let mut backup_kept = true;
@@ -641,7 +627,7 @@ where
     let result = (|| -> Result<()> {
         check_cancel(&cancel)?;
 
-        // ---- 2. Convert MP3s alongside FLACs -----------------------------
+        // ---- 2. Convert MP3s alongside sources ---------------------------
         let cache = CacheManager::new(&options.cache_root);
         cache.ensure_root()?;
         let contents = {
@@ -662,16 +648,16 @@ where
 
         let total = scope_paths.len() as u32;
         let done = AtomicU32::new(0);
-        for flac in &scope_paths {
+        for source in &scope_paths {
             check_cancel(&cancel)?;
-            if !flac.is_file() {
-                errors.push(format!("FLAC missing: {}", flac.display()));
+            if !source.is_file() {
+                errors.push(format!("source missing: {}", source.display()));
                 continue;
             }
-            let name = file_name(flac);
-            match place_mp3_beside_flac(
-                flac,
-                flac,
+            let name = file_name(source);
+            match place_mp3_beside_source(
+                source,
+                source,
                 contents.as_deref(),
                 &cache,
                 &convert_opts,
@@ -703,8 +689,8 @@ where
         let mut rewrites = Vec::new();
         let mut rewritten_ids = Vec::new();
         for track in &track_rows {
-            let flac = resolve_usb_path(root, track.file_path());
-            let mp3 = flac.with_extension("mp3");
+            let source = resolve_usb_path(root, track.file_path());
+            let mp3 = crate::formats::to_mp3_path(&source);
             if !mp3.is_file() || mp3.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
                 errors.push(format!(
                     "MP3 missing/empty before DB rewrite: {}",
@@ -713,7 +699,7 @@ where
                 continue;
             }
             let file_size = mp3.metadata().map(|m| m.len() as u32).unwrap_or(0);
-            let new_db_path = db_path_flac_to_mp3(track.file_path());
+            let new_db_path = crate::formats::db_path_to_mp3(track.file_path());
             let new_filename = PathBuf::from(&new_db_path)
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -806,17 +792,23 @@ where
             }
         }
 
-        // ---- 6. Delete FLACs (in-memory track rows still point at .flac) --
-        if !options.keep_flac {
-            emit(&mut on_progress, "cleanup", 0, 1, "Removing FLACs from USB");
-            for flac in &scope_paths {
-                let mp3 = flac.with_extension("mp3");
-                if flac.is_file() && mp3.is_file() {
-                    match fs::remove_file(flac) {
-                        Ok(()) => flacs_removed += 1,
+        // ---- 6. Delete sources (in-memory track rows still point at originals) --
+        if !options.keep_source {
+            emit(
+                &mut on_progress,
+                "cleanup",
+                0,
+                1,
+                "Removing source files from USB",
+            );
+            for source in &scope_paths {
+                let mp3 = crate::formats::to_mp3_path(source);
+                if source.is_file() && mp3.is_file() {
+                    match fs::remove_file(source) {
+                        Ok(()) => sources_removed += 1,
                         Err(e) => errors.push(format!(
                             "could not delete {}: {e}",
-                            flac.display()
+                            source.display()
                         )),
                     }
                 }
@@ -869,7 +861,7 @@ where
         cache_hits,
         pdb_updated,
         anlz_updated,
-        flacs_removed,
+        sources_removed,
         rolled_back,
         backup_kept,
         verify_problems: Vec::new(),
@@ -984,16 +976,18 @@ fn restore_backup(usb_root: &Path, backup_root: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn db_path_extension_swap() {
         assert_eq!(
-            db_path_flac_to_mp3("/Contents/A/x.flac"),
+            crate::formats::db_path_to_mp3("/Contents/A/x.flac"),
             "/Contents/A/x.mp3"
         );
         assert_eq!(
-            db_path_flac_to_mp3("/Contents/A/x.FLAC"),
+            crate::formats::db_path_to_mp3("/Contents/A/x.FLAC"),
+            "/Contents/A/x.mp3"
+        );
+        assert_eq!(
+            crate::formats::db_path_to_mp3("/Contents/A/x.wav"),
             "/Contents/A/x.mp3"
         );
     }

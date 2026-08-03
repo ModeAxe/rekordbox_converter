@@ -2,10 +2,11 @@
 //!
 //! Validates that a drive root contains a Rekordbox device export
 //! (`PIONEER/rekordbox/export.pdb`), walks the music folders and produces
-//! an inventory of audio files by format (FLAC / MP3 / other) with size
+//! an inventory of audio files (convertible / MP3 / other) with size
 //! totals used for the conversion-time estimate.
 
 use crate::error::{Error, Result};
+use crate::formats::{self, estimate_seconds};
 use crate::usb::is_rekordbox_export_root;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -14,10 +15,6 @@ use walkdir::WalkDir;
 /// Relative paths inside a Rekordbox USB export that we care about.
 pub const EXPORT_PDB: &str = "PIONEER/rekordbox/export.pdb";
 pub const EXPORT_EXT_PDB: &str = "PIONEER/rekordbox/exportExt.pdb";
-
-/// Rough seconds-per-MB for 320k FLAC→MP3 on a typical laptop CPU.
-/// Tuned later once real timing data exists; good enough for UI estimates.
-const SECONDS_PER_MB_FLAC: f64 = 0.35;
 
 /// Inventory of one Rekordbox-exported drive.
 #[derive(Debug, Clone, Serialize)]
@@ -33,15 +30,18 @@ pub struct ExportScan {
     pub has_export_ext: bool,
     /// Total audio files found under Contents/ (or the whole stick if no Contents/).
     pub total_tracks: u32,
-    pub flac_count: u32,
+    /// Non-MP3 audio that will be converted (FLAC, WAV, AIFF, …).
+    pub convertible_count: u32,
     pub mp3_count: u32,
+    /// Recognized-as-audio leftovers that are neither MP3 nor convertible
+    /// (should stay empty with the current allowlist; kept for diagnostics).
     pub other_count: u32,
-    /// Total bytes of FLAC files that would need conversion.
-    pub flac_bytes: u64,
-    /// Estimated wall-clock seconds for converting all FLACs (single-thread baseline).
+    /// Total bytes of convertible files.
+    pub convertible_bytes: u64,
+    /// Estimated wall-clock seconds for converting all convertible files.
     pub estimated_seconds: u32,
-    /// Absolute paths of every FLAC on the stick (for later phases).
-    pub flac_paths: Vec<String>,
+    /// Absolute paths of every convertible file on the stick.
+    pub convertible_paths: Vec<String>,
 }
 
 /// Scans `root` as a Rekordbox export and returns format counts + estimate.
@@ -67,11 +67,11 @@ pub fn scan_export(root: impl AsRef<Path>) -> Result<ExportScan> {
         }
     };
 
-    let mut flac_count = 0u32;
+    let mut convertible_count = 0u32;
     let mut mp3_count = 0u32;
-    let mut other_count = 0u32;
-    let mut flac_bytes = 0u64;
-    let mut flac_paths = Vec::new();
+    let other_count = 0u32;
+    let mut convertible_bytes = 0u64;
+    let mut convertible_paths = Vec::new();
 
     for entry in WalkDir::new(&search_root)
         .follow_links(false)
@@ -88,25 +88,24 @@ pub fn scan_export(root: impl AsRef<Path>) -> Result<ExportScan> {
             continue;
         }
         let path = entry.path();
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        let ext = formats::extension_of(path);
+        if ext.is_empty() {
             continue;
-        };
-        match ext.to_ascii_lowercase().as_str() {
-            "flac" => {
-                flac_count += 1;
-                if let Ok(meta) = entry.metadata() {
-                    flac_bytes += meta.len();
-                }
-                flac_paths.push(path.display().to_string());
-            }
-            "mp3" => mp3_count += 1,
-            "aiff" | "aif" | "wav" | "m4a" | "alac" | "aac" => other_count += 1,
-            _ => {}
         }
+        if formats::is_mp3(&ext) {
+            mp3_count += 1;
+        } else if formats::is_convertible(&ext) {
+            convertible_count += 1;
+            if let Ok(meta) = entry.metadata() {
+                convertible_bytes += meta.len();
+            }
+            convertible_paths.push(path.display().to_string());
+        }
+        // Unknown extensions (jpg, tmp, …) are ignored — not counted as audio.
     }
 
-    let total_tracks = flac_count + mp3_count + other_count;
-    let estimated_seconds = estimate_seconds(flac_bytes, flac_count);
+    let total_tracks = convertible_count + mp3_count + other_count;
+    let estimated_seconds = estimate_seconds(convertible_bytes, convertible_count);
 
     Ok(ExportScan {
         root: root.display().to_string(),
@@ -114,24 +113,13 @@ pub fn scan_export(root: impl AsRef<Path>) -> Result<ExportScan> {
         export_ext_pdb: has_export_ext.then(|| export_ext.display().to_string()),
         has_export_ext,
         total_tracks,
-        flac_count,
+        convertible_count,
         mp3_count,
         other_count,
-        flac_bytes,
+        convertible_bytes,
         estimated_seconds,
-        flac_paths,
+        convertible_paths,
     })
-}
-
-fn estimate_seconds(flac_bytes: u64, flac_count: u32) -> u32 {
-    if flac_count == 0 {
-        return 0;
-    }
-    let mb = flac_bytes as f64 / (1024.0 * 1024.0);
-    // Floor of 2s per track so tiny files don't show "0s".
-    let from_size = (mb * SECONDS_PER_MB_FLAC).ceil() as u32;
-    let from_count = flac_count.saturating_mul(2);
-    from_size.max(from_count)
 }
 
 /// Formats an estimate like `1m 42s` or `45s`.
@@ -183,14 +171,15 @@ mod tests {
         fs::write(dir.join("Contents/Artist/b.flac"), vec![0u8; 2048]).unwrap();
         fs::write(dir.join("Contents/Artist/c.mp3"), b"mp3").unwrap();
         fs::write(dir.join("Contents/Artist/d.wav"), b"wav").unwrap();
+        fs::write(dir.join("Contents/Artist/cover.jpg"), b"jpg").unwrap();
 
         let scan = scan_export(&dir).unwrap();
-        assert_eq!(scan.flac_count, 2);
+        assert_eq!(scan.convertible_count, 3); // 2 flac + 1 wav
         assert_eq!(scan.mp3_count, 1);
-        assert_eq!(scan.other_count, 1);
+        assert_eq!(scan.other_count, 0);
         assert_eq!(scan.total_tracks, 4);
         assert!(scan.has_export_ext);
-        assert_eq!(scan.flac_paths.len(), 2);
+        assert_eq!(scan.convertible_paths.len(), 3);
 
         let _ = fs::remove_dir_all(&dir);
     }

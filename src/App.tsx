@@ -21,12 +21,12 @@ type ExportScan = {
   exportExtPdb: string | null;
   hasExportExt: boolean;
   totalTracks: number;
-  flacCount: number;
+  convertibleCount: number;
   mp3Count: number;
   otherCount: number;
-  flacBytes: number;
+  convertibleBytes: number;
   estimatedSeconds: number;
-  flacPaths: string[];
+  convertiblePaths: string[];
 };
 
 type ScanState =
@@ -118,7 +118,7 @@ type StagedCopySummary = {
   cacheHits: number;
   pdbUpdated: number;
   anlzUpdated: number;
-  flacsRemoved: number;
+  sourcesRemoved: number;
   verifyProblems: string[];
   errors: string[];
 };
@@ -135,7 +135,7 @@ type InPlaceSummary = {
   cacheHits: number;
   pdbUpdated: number;
   anlzUpdated: number;
-  flacsRemoved: number;
+  sourcesRemoved: number;
   rolledBack: boolean;
   backupKept: boolean;
   verifyProblems: string[];
@@ -153,7 +153,7 @@ type PlaylistOption = {
   name: string;
   depth: number;
   trackCount: number;
-  flacCount: number;
+  convertibleCount: number;
   mp3Count: number;
   otherCount: number;
 };
@@ -161,8 +161,8 @@ type PlaylistOption = {
 type ConvertScope = {
   playlistId: number | null;
   playlistName: string | null;
-  flacPaths: string[];
-  flacCount: number;
+  convertiblePaths: string[];
+  convertibleCount: number;
   estimatedSeconds: number;
 };
 
@@ -170,7 +170,7 @@ type AppSettings = {
   bitrate: string;
   cacheRoot: string;
   workers: number;
-  keepFlac: boolean;
+  keepSource: boolean;
   verifyOutput: boolean;
   dryRun: boolean;
 };
@@ -183,7 +183,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   bitrate: "320k",
   cacheRoot: "",
   workers: 0,
-  keepFlac: false,
+  keepSource: false,
   verifyOutput: true,
   dryRun: false,
 };
@@ -282,7 +282,7 @@ export default function App() {
         });
         if (cancelled) return;
         setScanState({ state: "ready", scan, estimate });
-        if (scan.flacCount > 0 || scan.totalTracks > 0) {
+        if (scan.convertibleCount > 0 || scan.totalTracks > 0) {
           const list = await invoke<PlaylistOption[]>("list_export_playlists", {
             root: selectedRoot,
           });
@@ -386,10 +386,10 @@ export default function App() {
   const staging = pipelineState.state === "running";
   const inplace = inplaceState.state === "running";
   const busy = converting || staging || inplace;
-  const scopeFlacCount = scope?.flacCount ?? 0;
+  const scopeConvertibleCount = scope?.convertibleCount ?? 0;
   const canConvert =
     scanState.state === "ready" &&
-    scopeFlacCount > 0 &&
+    scopeConvertibleCount > 0 &&
     ffmpeg.state === "ok" &&
     !busy &&
     !scopeLoading;
@@ -410,7 +410,7 @@ export default function App() {
     if (!selectedRoot) return "Insert a USB drive";
     if (selected && !selected.isRekordboxExport) return "No export.pdb on drive";
     if (scanState.state === "ready") {
-      return `${scanState.scan.flacCount} FLAC · ${scanState.scan.mp3Count} MP3 · est ${scopeEstimate}`;
+      return `${scanState.scan.convertibleCount} to convert · ${scanState.scan.mp3Count} MP3 · est ${scopeEstimate}`;
     }
     if (scanState.state === "scanning") return "Scanning…";
     return "Ready";
@@ -425,7 +425,7 @@ export default function App() {
       if (s.errors.some((e) => e.startsWith("dry run"))) {
         return s.errors[0];
       }
-      return `USB OK — ${s.pdbUpdated} tracks, ${s.flacsRemoved} FLAC removed`;
+      return `USB OK — ${s.pdbUpdated} tracks, ${s.sourcesRemoved} sources removed`;
     }
     if (pipelineState.state === "done") {
       const s = pipelineState.summary;
@@ -479,12 +479,12 @@ export default function App() {
     if (!settings.dryRun) {
       const scopeLabel =
         playlistSelect === PLAYLIST_ALL
-          ? "ALL FLACs on this USB"
+          ? "ALL non-MP3 audio on this USB"
           : `playlist (${scope?.playlistName ?? "selected"})`;
       const ok = window.confirm(
         `Convert ${scopeLabel} in place on ${selectedRoot}?\n\n` +
-          "Rewrites the USB database and replaces FLACs with MP3s.\n" +
-          "Failure before FLAC delete rolls the DB back.",
+          "Rewrites the USB database and replaces sources with MP3s.\n" +
+          "Failure before source delete rolls the DB back.",
       );
       if (!ok) return;
     }
@@ -634,7 +634,7 @@ export default function App() {
                   <label>Export</label>
                   <span className="value">
                     {scanState.state === "ready"
-                      ? `${scanState.scan.totalTracks} tracks · ${scanState.scan.flacCount} FLAC · ${scanState.scan.mp3Count} MP3`
+                      ? `${scanState.scan.totalTracks} tracks · ${scanState.scan.convertibleCount} to convert · ${scanState.scan.mp3Count} MP3`
                       : scanState.state === "scanning"
                         ? "Scanning…"
                         : scanState.state === "error"
@@ -655,15 +655,15 @@ export default function App() {
                     onChange={(e) => setPlaylistSelect(e.target.value)}
                   >
                     <option value={PLAYLIST_ALL}>
-                      All FLACs
+                      All non-MP3
                       {scanState.state === "ready"
-                        ? ` (${scanState.scan.flacCount})`
+                        ? ` (${scanState.scan.convertibleCount})`
                         : ""}
                     </option>
                     {playlists.map((p) => (
                       <option key={p.id} value={String(p.id)}>
                         {"\u00A0".repeat(p.depth * 2)}
-                        {p.name} ({p.flacCount} FLAC)
+                        {p.name} ({p.convertibleCount} convert)
                       </option>
                     ))}
                   </select>
@@ -673,7 +673,7 @@ export default function App() {
                   <span className="value">
                     {scopeLoading ? "…" : scopeEstimate}
                     {settings.dryRun ? " · dry-run" : ""}
-                    {settings.keepFlac ? " · keep FLAC" : ""}
+                    {settings.keepSource ? " · keep source" : ""}
                   </span>
                 </div>
               </fieldset>
@@ -860,17 +860,17 @@ export default function App() {
                 <legend>USB safety</legend>
                 <div className="field-row">
                   <input
-                    checked={settingsDraft.keepFlac}
+                    checked={settingsDraft.keepSource}
                     type="checkbox"
-                    id="keepFlac"
+                    id="keepSource"
                     onChange={(e) =>
                       setSettingsDraft({
                         ...settingsDraft,
-                        keepFlac: e.target.checked,
+                        keepSource: e.target.checked,
                       })
                     }
                   />
-                  <label htmlFor="keepFlac">Keep FLAC on USB</label>
+                  <label htmlFor="keepSource">Keep source files on USB</label>
                 </div>
                 <div className="field-row">
                   <input
