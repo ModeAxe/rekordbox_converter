@@ -465,14 +465,9 @@ fn copy_dir_recursive(
     Ok(())
 }
 
-/// Default staged-output parent: `%LOCALAPPDATA%/RekordboxUsbConverter/Staged`
+/// Default staged-output parent: `%LOCALAPPDATA%/DrokerBox/Staged`
 pub fn default_staged_parent() -> PathBuf {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(local)
-            .join("RekordboxUsbConverter")
-            .join("Staged");
-    }
-    std::env::temp_dir().join("rekordbox-usb-converter-staged")
+    crate::app_dirs::app_data_root().join("Staged")
 }
 
 // ---------------------------------------------------------------------------

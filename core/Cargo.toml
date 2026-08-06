@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Core engine: USB detection, Rekordbox export scanning, PDB/ANLZ rewriting, FFmpeg conversion, cache and pipeline orchestration"
+description = "DrokerBox core: USB detection, Rekordbox export scanning, PDB/ANLZ rewriting, FFmpeg conversion, cache and pipeline"
 
 [dependencies]
 thiserror = { workspace = true }

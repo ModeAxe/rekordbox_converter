@@ -1,12 +1,13 @@
-//! Persistent user settings for the converter.
+//! Persistent user settings for DrokerBox.
 //!
-//! Stored as JSON under `%LOCALAPPDATA%/RekordboxUsbConverter/settings.json`.
+//! Stored as JSON under `%LOCALAPPDATA%/DrokerBox/settings.json`.
 
 use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app_dirs;
 use crate::cache;
 use crate::error::{Error, Result};
 
@@ -77,24 +78,30 @@ pub fn parse_bitrate_kbps(s: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// `%LOCALAPPDATA%/RekordboxUsbConverter/settings.json`
+/// `%LOCALAPPDATA%/DrokerBox/settings.json`
 pub fn settings_path() -> PathBuf {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(local)
-            .join("RekordboxUsbConverter")
-            .join("settings.json");
-    }
-    std::env::temp_dir()
-        .join("rekordbox-usb-converter")
-        .join("settings.json")
+    app_dirs::app_data_root().join("settings.json")
+}
+
+fn legacy_settings_path() -> Option<PathBuf> {
+    app_dirs::legacy_app_data_root().map(|root| root.join("settings.json"))
 }
 
 pub fn load() -> AppSettings {
     let path = settings_path();
-    let Ok(data) = fs::read_to_string(&path) else {
-        return AppSettings::default();
-    };
-    serde_json::from_str(&data).unwrap_or_default()
+    if let Ok(data) = fs::read_to_string(&path) {
+        return serde_json::from_str(&data).unwrap_or_default();
+    }
+    // One-time: pick up settings from the pre-rename folder if present.
+    if let Some(legacy) = legacy_settings_path() {
+        if let Ok(data) = fs::read_to_string(&legacy) {
+            if let Ok(settings) = serde_json::from_str::<AppSettings>(&data) {
+                let _ = save(&settings);
+                return settings;
+            }
+        }
+    }
+    AppSettings::default()
 }
 
 pub fn save(settings: &AppSettings) -> Result<()> {

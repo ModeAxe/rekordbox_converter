@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Converts FLAC files on Rekordbox-exported USB drives to 320k MP3 while preserving the Pioneer database"
+description = "DrokerBox: convert non-MP3 audio on Rekordbox-exported USB drives to MP3 while preserving the Pioneer database"
 
 [lib]
 # The `_lib` suffix avoids a name clash with the binary on Windows,

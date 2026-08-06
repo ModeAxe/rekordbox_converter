@@ -1,4 +1,4 @@
-//! Build a structured, UI-friendly dump of a DrokerBox USB export database.
+//! Build a structured, UI-friendly dump of a Rekordbox USB export database.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

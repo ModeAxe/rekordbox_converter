@@ -1,6 +1,6 @@
 //! # rbusb-core
 //!
-//! Core engine for the Rekordbox USB non-MP3→MP3 converter.
+//! Core engine for **DrokerBox** — Rekordbox USB non-MP3→MP3 converter.
 //!
 //! This crate contains all business logic and is deliberately free of any
 //! UI-framework dependency (no Tauri imports). The Tauri shell in
@@ -11,6 +11,7 @@
 //!
 //! | Module       | Responsibility                                                        |
 //! |--------------|-----------------------------------------------------------------------|
+//! | [`app_dirs`] | Local data roots (settings, cache, staged copies)                    |
 //! | [`usb`]      | Enumerate removable drives and watch for insertion/removal (Windows)  |
 //! | [`scanner`]  | Validate a drive as a Rekordbox export and inventory its audio files  |
 //! | [`formats`]  | Which extensions are convertible vs MP3 passthrough                   |
@@ -22,6 +23,7 @@
 //! | [`pipeline`] | Transactional orchestration: backup, convert, rewrite, verify, rollback |
 
 pub mod anlz;
+pub mod app_dirs;
 pub mod cache;
 pub mod convert;
 pub mod error;

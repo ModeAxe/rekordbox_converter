@@ -180,20 +180,9 @@ fn fallback_relative(flac: &Path) -> PathBuf {
     PathBuf::from(artist).join(file)
 }
 
-/// Default cache directory: `%LOCALAPPDATA%/RekordboxUsbConverter/Cache` on Windows,
-/// otherwise `~/.cache/rekordbox-usb-converter`.
+/// Default cache directory: `%LOCALAPPDATA%/DrokerBox/Cache`.
 pub fn default_cache_root() -> PathBuf {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(local)
-            .join("RekordboxUsbConverter")
-            .join("Cache");
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("rekordbox-usb-converter");
-    }
-    std::env::temp_dir().join("rekordbox-usb-converter-cache")
+    crate::app_dirs::app_data_root().join("Cache")
 }
 
 #[cfg(test)]
