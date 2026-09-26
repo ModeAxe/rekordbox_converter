@@ -311,6 +311,96 @@ pub fn run_ffmpeg(
     Ok(())
 }
 
+/// Sample rate and bit depth reported by ffprobe for one audio file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioProbe {
+    pub sample_rate: u32,
+    pub sample_depth: Option<u16>,
+}
+
+/// `ffprobe` sitting next to the given `ffmpeg` executable.
+pub fn ffprobe_path_for(ffmpeg: &Path) -> PathBuf {
+    let name = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
+    match ffmpeg.parent() {
+        Some(dir) => dir.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Reads stream sample rate (and bit depth, when non-zero) via ffprobe.
+pub fn probe_audio(ffprobe: &Path, input: &Path) -> Result<AudioProbe> {
+    let mut cmd = Command::new(ffprobe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd
+        .arg("-hide_banner")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("a:0")
+        .arg("-show_entries")
+        .arg("stream=sample_rate,bits_per_raw_sample")
+        .arg("-of")
+        .arg("json")
+        .arg(input)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Message(format!(
+            "ffprobe failed ({}): {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_probe_json(&stdout)
+}
+
+pub(crate) fn parse_probe_json(json: &str) -> Result<AudioProbe> {
+    #[derive(serde::Deserialize)]
+    struct ProbeFile {
+        streams: Vec<ProbeStream>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ProbeStream {
+        sample_rate: Option<String>,
+        bits_per_raw_sample: Option<String>,
+    }
+
+    let parsed: ProbeFile =
+        serde_json::from_str(json).map_err(|e| Error::Message(format!("ffprobe json: {e}")))?;
+    let stream = parsed
+        .streams
+        .first()
+        .ok_or_else(|| Error::Message("ffprobe returned no audio stream".into()))?;
+    let sample_rate = stream
+        .sample_rate
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<u32>()
+        .unwrap_or(0);
+    if sample_rate == 0 {
+        return Err(Error::Message("ffprobe sample rate was 0".into()));
+    }
+    let sample_depth = stream
+        .bits_per_raw_sample
+        .as_deref()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|d| *d > 0);
+    Ok(AudioProbe {
+        sample_rate,
+        sample_depth,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +408,21 @@ mod tests {
     #[test]
     fn default_workers_at_least_one() {
         assert!(default_worker_count() >= 1);
+    }
+
+    #[test]
+    fn parse_probe_json_reads_rate_and_depth() {
+        let json = r#"{"streams":[{"sample_rate":"44100","bits_per_raw_sample":"16"}]}"#;
+        let info = parse_probe_json(json).unwrap();
+        assert_eq!(info.sample_rate, 44100);
+        assert_eq!(info.sample_depth, Some(16));
+    }
+
+    #[test]
+    fn parse_probe_json_ignores_zero_depth() {
+        let json = r#"{"streams":[{"sample_rate":"48000","bits_per_raw_sample":"0"}]}"#;
+        let info = parse_probe_json(json).unwrap();
+        assert_eq!(info.sample_rate, 48000);
+        assert_eq!(info.sample_depth, None);
     }
 }

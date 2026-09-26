@@ -737,8 +737,10 @@ impl PdbEditor {
     /// Updates a track's on-disk audio identity for a FLAC→MP3 conversion.
     ///
     /// Patches `bitrate`, `file_size`, and `file_type` in place, then rewrites
-    /// the filename (string slot 19) and file_path (slot 20) DeviceSQL strings
-    /// in place within the existing row allocation. Track id is unchanged.
+    /// the filename (string slot 19), file_path (slot 20), and — when
+    /// `new_analyze_path` is non-empty — analyze_path (slot 14) DeviceSQL
+    /// strings in place within the existing row allocation. Track id is
+    /// unchanged. `sample_rate` and `sample_depth` are patched when `Some`.
     ///
     /// Returns an error if the new strings do not fit in the current allocation
     /// (unexpected for a `.flac` → `.mp3` shrink, but possible for other renames).
@@ -749,10 +751,19 @@ impl PdbEditor {
         new_filename: &str,
         bitrate: u32,
         file_size: u32,
+        new_analyze_path: &str,
+        sample_rate: Option<u32>,
+        sample_depth: Option<u16>,
     ) -> Result<()> {
         self.set_track_field(track_id, "bitrate", bitrate)?;
         self.set_track_field(track_id, "file_size", file_size)?;
         self.set_track_field(track_id, "file_type", file_type_code(new_file_path) as u32)?;
+        if let Some(rate) = sample_rate {
+            self.set_track_field(track_id, "sample_rate", rate)?;
+        }
+        if let Some(depth) = sample_depth {
+            self.set_track_field(track_id, "sample_depth", depth as u32)?;
+        }
 
         let db = self.database()?;
         let locs = db.row_locations(TableType::Tracks);
@@ -818,10 +829,60 @@ impl PdbEditor {
         self.put_u16(loc + 0x5e + 2 * 19, new_off19 as u16);
         self.put_u16(loc + 0x5e + 2 * 20, new_off20 as u16);
 
+        if !new_analyze_path.is_empty() {
+            self.replace_string_slot(loc, row_end, 14, new_analyze_path)?;
+        }
+
         // Touch generation so players notice the edit.
         let page_index = (loc / self.page_size) as u32;
         self.mark_table_touched(TableType::Tracks as u32, page_index)?;
         let _ = pos;
+        Ok(())
+    }
+
+    /// Overwrites one DeviceSQL string slot if the new encoding fits in the
+    /// gap before the next string (or the end of the row).
+    fn replace_string_slot(
+        &mut self,
+        loc: usize,
+        row_end: usize,
+        slot: usize,
+        text: &str,
+    ) -> Result<()> {
+        let off = self.u16(loc + 0x5e + 2 * slot) as usize;
+        if off == 0 {
+            return Err(PdbError::RowTooLarge { alloc: 1, max: 0 });
+        }
+        let abs = loc + off;
+        if abs >= row_end {
+            return Err(PdbError::RowTooLarge {
+                alloc: 0,
+                max: row_end.saturating_sub(loc),
+            });
+        }
+        let mut next = row_end;
+        for i in 0..21 {
+            let other = self.u16(loc + 0x5e + 2 * i) as usize;
+            if other == 0 {
+                continue;
+            }
+            let other_abs = loc + other;
+            if other_abs > abs && other_abs < next {
+                next = other_abs;
+            }
+        }
+        let enc = encode_string(text)?;
+        let span = next - abs;
+        if enc.len() > span {
+            return Err(PdbError::RowTooLarge {
+                alloc: enc.len(),
+                max: span,
+            });
+        }
+        self.buf[abs..abs + enc.len()].copy_from_slice(&enc);
+        if enc.len() < span {
+            self.buf[abs + enc.len()..next].fill(0);
+        }
         Ok(())
     }
 

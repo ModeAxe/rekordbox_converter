@@ -16,7 +16,8 @@
 //! | [`scanner`]  | Validate a drive as a Rekordbox export and inventory its audio files  |
 //! | [`formats`]  | Which extensions are convertible vs MP3 passthrough                   |
 //! | [`pdb`]      | Read and surgically rewrite `export.pdb` / `exportExt.pdb`            |
-//! | [`anlz`]     | Read and rewrite ANLZ analysis files (`.DAT`/`.EXT`/`.2EX`, PPTH tag) |
+//! | [`anlz`]     | Read, relocate, and rewrite ANLZ analysis files (`.DAT`/`.EXT`/`.2EX`) |
+//! | [`export_library`] | Update Device Library Plus `exportLibrary.db` after conversion |
 //! | [`convert`]  | FFmpeg wrapper and multi-threaded conversion queue                    |
 //! | [`cache`]    | Converted-MP3 cache keyed by source file identity                     |
 //! | [`settings`] | Persistent user options (bitrate, workers, dry-run, …)                |
@@ -27,11 +28,13 @@ pub mod app_dirs;
 pub mod cache;
 pub mod convert;
 pub mod error;
+pub mod export_library;
 pub mod formats;
 pub mod pdb;
 pub mod pipeline;
 pub mod scanner;
 pub mod settings;
+mod sqlite_mc;
 pub mod usb;
 
 pub use error::{Error, Result};

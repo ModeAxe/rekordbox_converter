@@ -2443,6 +2443,7 @@ name = "rbusb-core"
 version = "0.1.0"
 dependencies = [
  "binrw",
+ "cc",
  "crc32fast",
  "rayon",
  "rekordbox-pdb",

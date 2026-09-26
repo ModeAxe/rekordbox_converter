@@ -20,6 +20,9 @@ rekordbox-pdb = { path = "../vendor/rekordbox-pdb" }
 rekordcrate = { version = "0.3.0", default-features = false, optional = true }
 binrw = { version = "0.14", optional = true }
 
+[build-dependencies]
+cc = "1"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",

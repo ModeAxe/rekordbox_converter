@@ -14,12 +14,18 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone)]
 pub struct TrackAudioRewrite {
     pub track_id: u32,
+    pub old_file_path: String,
     pub new_file_path: String,
     pub new_filename: String,
     pub bitrate: u32,
     pub file_size: u32,
-    /// DeviceSQL analyze_path (`/PIONEER/USBANLZ/.../ANLZ0000.DAT`), if any.
-    pub analyze_path: String,
+    /// Previous DeviceSQL analyze_path, used to find the ANLZ directory.
+    pub old_analyze_path: String,
+    /// Hash path of `new_file_path` (`/PIONEER/USBANLZ/.../ANLZ0000.DAT`).
+    pub new_analyze_path: String,
+    /// From ffprobe of the MP3, when available.
+    pub sample_rate: Option<u32>,
+    pub sample_depth: Option<u16>,
 }
 
 /// Result of applying rewrites to an export.pdb.
@@ -54,6 +60,9 @@ pub fn rewrite_track_audio(
             &r.new_filename,
             r.bitrate,
             r.file_size,
+            &r.new_analyze_path,
+            r.sample_rate,
+            r.sample_depth,
         ) {
             Ok(()) => updated += 1,
             Err(e) => failed.push(format!("track {}: {e}", r.track_id)),
@@ -120,7 +129,76 @@ pub fn verify_rewritten_pdb(
         if track.bitrate == 0 {
             problems.push(format!("track {id} bitrate is 0"));
         }
+
+        let expected_anlz = crate::anlz::analyze_db_path(path);
+        let actual_anlz = track.analyze_path();
+        if !actual_anlz.is_empty() {
+            if !crate::anlz::same_export_path(actual_anlz, &expected_anlz) {
+                problems.push(format!(
+                    "track {id} analyze_path {actual_anlz} is not the audio-path hash {expected_anlz}"
+                ));
+            } else {
+                let anlz_abs = resolve_usb_path(root, actual_anlz);
+                if !anlz_abs.is_file() {
+                    problems.push(format!(
+                        "track {id} ANLZ missing: {}",
+                        anlz_abs.display()
+                    ));
+                } else {
+                    match crate::anlz::read_ppath(&anlz_abs) {
+                        Ok(Some(ppth)) if crate::anlz::same_export_path(&ppth, path) => {}
+                        Ok(Some(ppth)) => problems.push(format!(
+                            "track {id} ANLZ PPTH {ppth} does not match {path}"
+                        )),
+                        Ok(None) => problems.push(format!("track {id} ANLZ has no PPTH tag")),
+                        Err(e) => problems.push(format!("track {id} ANLZ unreadable: {e}")),
+                    }
+                }
+            }
+        }
     }
 
+    problems.extend(crate::export_library::verify_against_tracks(
+        root,
+        &db,
+        rewritten_ids,
+    ));
+
     Ok(problems)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_flags_anlz_not_at_audio_hash() {
+        let root = std::env::temp_dir().join(format!(
+            "drokerbox-verify-{}",
+            std::process::id()
+        ));
+        let pdb_dir = root.join("PIONEER").join("rekordbox");
+        std::fs::create_dir_all(&pdb_dir).unwrap();
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../vendor/rekordbox-pdb/tests/data/one-song-export.pdb");
+        let pdb = pdb_dir.join("export.pdb");
+        std::fs::copy(&src, &pdb).unwrap();
+
+        let db = Database::from_file(&pdb).unwrap();
+        let problems = verify_rewritten_pdb(
+            &root,
+            &pdb,
+            db.tracks.len(),
+            db.playlist_entries.len(),
+            &[db.tracks[0].id],
+        )
+        .unwrap();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("is not the audio-path hash")),
+            "{problems:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
