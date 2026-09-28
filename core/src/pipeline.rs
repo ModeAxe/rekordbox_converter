@@ -264,16 +264,40 @@ where
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| new_db_path.clone());
+        let old_analyze = track.analyze_path().to_string();
+        let new_analyze = analyze_path_for(&old_analyze, &new_db_path);
+        let (sample_rate, sample_depth) = probe_mp3(&options.ffmpeg_path, &out_mp3);
 
         rewrites.push(TrackAudioRewrite {
             track_id: track.id,
+            old_file_path: track.file_path().to_string(),
             new_file_path: new_db_path,
             new_filename,
             bitrate: bitrate_kbps,
             file_size,
-            analyze_path: track.analyze_path().to_string(),
+            old_analyze_path: old_analyze,
+            new_analyze_path: new_analyze,
+            sample_rate,
+            sample_depth,
         });
         rewritten_ids.push(track.id);
+    }
+
+    // Move ANLZ next to the MP3 hash path before the database points at it.
+    emit(
+        &mut on_progress,
+        "rewrite-anlz",
+        0,
+        1,
+        "Relocating ANLZ files and rewriting PPTH",
+    );
+    let mut anlz_updated = 0u32;
+    let mut relocated = Vec::new();
+    for r in &rewrites {
+        match retarget_anlz(out, r, &mut relocated) {
+            Ok(n) => anlz_updated += n,
+            Err(e) => errors.push(e.to_string()),
+        }
     }
 
     let out_pdb = export_pdb_path(out);
@@ -282,31 +306,8 @@ where
         errors.push(f.clone());
     }
 
-    // 5. Rewrite ANLZ PPTH for each track (DAT + siblings EXT/2EX in same folder).
-    emit(&mut on_progress, "rewrite-anlz", 0, 1, "Rewriting ANLZ PPTH");
-    let mut anlz_updated = 0u32;
-    for r in &rewrites {
-        if r.analyze_path.is_empty() {
-            continue;
-        }
-        let anlz_dat = resolve_usb_path(out, &r.analyze_path);
-        let dir = match anlz_dat.parent() {
-            Some(d) => d.to_path_buf(),
-            None => continue,
-        };
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with("ANLZ") {
-                    continue;
-                }
-                match anlz::rewrite_ppath(&p, &r.new_file_path) {
-                    Ok(()) => anlz_updated += 1,
-                    Err(e) => errors.push(format!("{}: {e}", p.display())),
-                }
-            }
-        }
+    if let Err(e) = sync_export_library(out, &rewrites) {
+        errors.push(e.to_string());
     }
 
     // 6. Verify
@@ -614,6 +615,7 @@ where
     let mut cache_hits = 0u32;
     let mut converted = 0u32;
     let mut anlz_updated = 0u32;
+    let mut relocated: Vec<PathBuf> = Vec::new();
     let mut sources_removed = 0u32;
     let mut pdb_updated = 0u32;
     let mut rolled_back = false;
@@ -699,13 +701,20 @@ where
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| new_db_path.clone());
+            let old_analyze = track.analyze_path().to_string();
+            let new_analyze = analyze_path_for(&old_analyze, &new_db_path);
+            let (sample_rate, sample_depth) = probe_mp3(&options.ffmpeg_path, &mp3);
             rewrites.push(TrackAudioRewrite {
                 track_id: track.id,
+                old_file_path: track.file_path().to_string(),
                 new_file_path: new_db_path,
                 new_filename,
                 bitrate: bitrate_kbps,
                 file_size,
-                analyze_path: track.analyze_path().to_string(),
+                old_analyze_path: old_analyze,
+                new_analyze_path: new_analyze,
+                sample_rate,
+                sample_depth,
             });
             rewritten_ids.push(track.id);
         }
@@ -716,7 +725,21 @@ where
             ));
         }
 
-        // ---- 4. Rewrite PDB + ANLZ ---------------------------------------
+        // ---- 4. Relocate ANLZ, then rewrite PDB + Device Library Plus -----
+        emit(
+            &mut on_progress,
+            "rewrite-anlz",
+            0,
+            1,
+            "Relocating ANLZ files and rewriting PPTH",
+        );
+        for r in &rewrites {
+            match retarget_anlz(root, r, &mut relocated) {
+                Ok(n) => anlz_updated += n,
+                Err(e) => return Err(e),
+            }
+        }
+
         emit(
             &mut on_progress,
             "rewrite-pdb",
@@ -730,35 +753,7 @@ where
             errors.push(f);
         }
 
-        emit(
-            &mut on_progress,
-            "rewrite-anlz",
-            0,
-            1,
-            "Rewriting ANLZ PPTH tags",
-        );
-        for r in &rewrites {
-            if r.analyze_path.is_empty() {
-                continue;
-            }
-            let anlz_dat = resolve_usb_path(root, &r.analyze_path);
-            let Some(dir) = anlz_dat.parent() else {
-                continue;
-            };
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if !name.starts_with("ANLZ") {
-                        continue;
-                    }
-                    match anlz::rewrite_ppath(&p, &r.new_file_path) {
-                        Ok(()) => anlz_updated += 1,
-                        Err(e) => errors.push(format!("{}: {e}", p.display())),
-                    }
-                }
-            }
-        }
+        sync_export_library(root, &rewrites)?;
 
         // ---- 5. Re-verify ------------------------------------------------
         emit(
@@ -834,6 +829,9 @@ where
             // Keep backup so the user can inspect / recover manually if needed.
             backup_kept = true;
         }
+        for dir in &relocated {
+            let _ = fs::remove_dir_all(dir);
+        }
         errors.push(e.to_string());
     }
 
@@ -878,6 +876,16 @@ fn create_backup(
     let ext = export_ext_pdb_path(usb_root);
     if ext.is_file() {
         backup_one(usb_root, backup_root, &ext, &mut files)?;
+    }
+
+    let library = crate::export_library::export_library_db_path(usb_root);
+    if library.is_file() {
+        backup_one(usb_root, backup_root, &library, &mut files)?;
+        for side in sqlite_sidecars(&library) {
+            if side.is_file() {
+                backup_one(usb_root, backup_root, &side, &mut files)?;
+            }
+        }
     }
 
     for track in tracks {
@@ -967,6 +975,95 @@ fn restore_backup(usb_root: &Path, backup_root: &Path) -> Result<()> {
         fs::copy(&src, &dest)?;
     }
     Ok(())
+}
+
+fn analyze_path_for(old_analyze: &str, new_audio_path: &str) -> String {
+    if old_analyze.is_empty() {
+        String::new()
+    } else {
+        anlz::analyze_db_path(new_audio_path)
+    }
+}
+
+fn probe_mp3(ffmpeg: &Path, mp3: &Path) -> (Option<u32>, Option<u16>) {
+    let bin = convert::ffprobe_path_for(ffmpeg);
+    if !bin.is_file() {
+        return (None, None);
+    }
+    match convert::probe_audio(&bin, mp3) {
+        Ok(info) => (Some(info.sample_rate), info.sample_depth),
+        Err(_) => (None, None),
+    }
+}
+
+/// Moves ANLZ files onto the hash path of the new audio file and rewrites PPTH.
+/// Returns how many analysis files had their PPTH updated.
+fn retarget_anlz(
+    root: &Path,
+    rewrite: &TrackAudioRewrite,
+    relocated: &mut Vec<PathBuf>,
+) -> Result<u32> {
+    if rewrite.old_analyze_path.is_empty() {
+        return Ok(0);
+    }
+    let new_analyze = if rewrite.new_analyze_path.is_empty() {
+        anlz::analyze_db_path(&rewrite.new_file_path)
+    } else {
+        rewrite.new_analyze_path.clone()
+    };
+    let src_file = resolve_usb_path(root, &rewrite.old_analyze_path);
+    let src_dir = src_file.parent().ok_or_else(|| {
+        Error::Message(format!(
+            "analyze path has no directory: {}",
+            rewrite.old_analyze_path
+        ))
+    })?;
+    let dest_file = resolve_usb_path(root, &new_analyze);
+    let dest_dir = dest_file.parent().ok_or_else(|| {
+        Error::Message(format!("analyze path has no directory: {new_analyze}"))
+    })?;
+
+    if !anlz::same_export_path(&rewrite.old_analyze_path, &new_analyze) {
+        relocated.push(dest_dir.to_path_buf());
+        anlz::relocate_anlz_dir(src_dir, dest_dir)?;
+    }
+    anlz::rewrite_dir_ppath(dest_dir, &rewrite.new_file_path)
+}
+
+fn sync_export_library(root: &Path, rewrites: &[TrackAudioRewrite]) -> Result<()> {
+    let updates: Vec<crate::export_library::LibraryTrackUpdate> = rewrites
+        .iter()
+        .map(|r| crate::export_library::LibraryTrackUpdate {
+            old_path: r.old_file_path.clone(),
+            new_path: r.new_file_path.clone(),
+            file_name: r.new_filename.clone(),
+            file_size: r.file_size,
+            bitrate: r.bitrate,
+            sample_rate: r.sample_rate,
+            sample_depth: r.sample_depth,
+            analyze_path: r.new_analyze_path.clone(),
+        })
+        .collect();
+    let summary = crate::export_library::update_tracks(root, &updates)?;
+    if summary.missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Message(format!(
+        "exportLibrary.db missing content rows: {}",
+        summary.missing.join(", ")
+    )))
+}
+
+fn sqlite_sidecars(db: &Path) -> [PathBuf; 2] {
+    let name = db
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = db.parent().unwrap_or_else(|| Path::new(""));
+    [
+        parent.join(format!("{name}-wal")),
+        parent.join(format!("{name}-shm")),
+    ]
 }
 
 #[cfg(test)]

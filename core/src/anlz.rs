@@ -170,6 +170,149 @@ fn parse_ppath(data: &[u8]) -> Option<String> {
     None
 }
 
+/// Pioneer USBANLZ directory for `audio_db_path` (e.g. `/Contents/A/Track.mp3`).
+///
+/// Players ignore the track row's `analyze_path` and hash the audio path
+/// themselves. The result is `/PIONEER/USBANLZ/P{XXX}/{YYYYYYYY}/ANLZ0000.DAT`.
+pub fn analyze_db_path(audio_db_path: &str) -> String {
+    let (p_value, hash_value) = hash_audio_path(audio_db_path);
+    format!("/PIONEER/USBANLZ/P{p_value:03X}/{hash_value:08X}/ANLZ0000.DAT")
+}
+
+/// `(P value, hash)` used in the USBANLZ directory name.
+///
+/// Matches the algorithm used by rekordbox / CDJ `CreateAnlzFileFolderPath`:
+/// UTF-16 code units, multipliers `0x5BC9` and `0x93B5`, modulo `200003`.
+pub fn hash_audio_path(file_path: &str) -> (u32, u32) {
+    let mut hash_val: u32 = 0;
+    for ch in file_path.chars() {
+        let c = (ch as u32) & 0xFFFF;
+        let temp = hash_val.wrapping_mul(0x5BC9).wrapping_add(c);
+        hash_val = temp.wrapping_mul(0x93B5).wrapping_add(c);
+    }
+    let hash_result = hash_val % 200_003;
+    let mut p = 0u32;
+    p |= (hash_result >> 0) & 0x01;
+    p |= (hash_result >> 1) & 0x02;
+    p |= (hash_result >> 4) & 0x04;
+    p |= (hash_result >> 4) & 0x08;
+    p |= (hash_result >> 5) & 0x10;
+    p |= (hash_result >> 8) & 0x20;
+    p |= (hash_result >> 10) & 0x40;
+    (p, hash_result)
+}
+
+/// True when two DeviceSQL paths refer to the same export location.
+pub fn same_export_path(a: &str, b: &str) -> bool {
+    normalize_export_path(a) == normalize_export_path(b)
+}
+
+fn normalize_export_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+/// Moves every `ANLZ*` file from `src_dir` into `dest_dir`.
+///
+/// Returns how many files were moved. The source directory (and its parent,
+/// when left empty) is removed after a full move.
+pub fn relocate_anlz_dir(src_dir: &Path, dest_dir: &Path) -> Result<u32> {
+    if !src_dir.is_dir() {
+        return Err(Error::Message(format!(
+            "ANLZ directory missing: {}",
+            src_dir.display()
+        )));
+    }
+    if same_dir(src_dir, dest_dir) {
+        return Ok(0);
+    }
+
+    let files = anlz_files_in(src_dir);
+    if files.is_empty() {
+        return Err(Error::Message(format!(
+            "no ANLZ files in {}",
+            src_dir.display()
+        )));
+    }
+
+    std::fs::create_dir_all(dest_dir)?;
+    for src in &files {
+        let name = src.file_name().ok_or_else(|| {
+            Error::Message(format!("ANLZ path has no file name: {}", src.display()))
+        })?;
+        let dest = dest_dir.join(name);
+        if dest.exists() {
+            std::fs::remove_file(&dest)?;
+        }
+        move_file(src, &dest)?;
+    }
+
+    remove_dir_if_empty(src_dir);
+    if let Some(parent) = src_dir.parent() {
+        remove_dir_if_empty(parent);
+    }
+    Ok(files.len() as u32)
+}
+
+/// Rewrites `PPTH` in every `ANLZ*` file in `dir`. Returns how many succeeded.
+pub fn rewrite_dir_ppath(dir: &Path, new_audio_path: &str) -> Result<u32> {
+    if !dir.is_dir() {
+        return Err(Error::Message(format!(
+            "ANLZ directory missing: {}",
+            dir.display()
+        )));
+    }
+    let mut updated = 0u32;
+    for path in anlz_files_in(dir) {
+        rewrite_ppath(&path, new_audio_path)?;
+        updated += 1;
+    }
+    Ok(updated)
+}
+
+fn anlz_files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("ANLZ") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    normalize_export_path(&a.to_string_lossy()) == normalize_export_path(&b.to_string_lossy())
+}
+
+fn move_file(src: &Path, dest: &Path) -> Result<()> {
+    if std::fs::rename(src, dest).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dest)?;
+    std::fs::remove_file(src)?;
+    Ok(())
+}
+
+fn remove_dir_if_empty(dir: &Path) {
+    let Ok(mut entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    if entries.next().is_none() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
 fn decode_utf16be_nul(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
         .chunks_exact(2)
@@ -210,5 +353,60 @@ mod tests {
         assert_eq!(total as usize, out.len());
         // Shorter extension → smaller file.
         assert!(out.len() < data.len());
+    }
+
+    #[test]
+    fn hash_matches_known_exports() {
+        let cases = [
+            (
+                "/Contents/Leo Portela/Bon Vibrant - Leo Portela.flac",
+                "/PIONEER/USBANLZ/P00E/000281CE/ANLZ0000.DAT",
+            ),
+            (
+                "/Contents/Daniela Cast/Jazzy - Daniela Cast.flac",
+                "/PIONEER/USBANLZ/P00A/0000CC9C/ANLZ0000.DAT",
+            ),
+            (
+                "/Contents/Zorrovian/BIOS/Zorrovian - BIOS.flac",
+                "/PIONEER/USBANLZ/P024/00006070/ANLZ0000.DAT",
+            ),
+            (
+                "/Contents/Zorrovian/BIOS/Zorrovian - BIOS.mp3",
+                "/PIONEER/USBANLZ/P036/0002F34C/ANLZ0000.DAT",
+            ),
+        ];
+        for (audio, anlz) in cases {
+            assert_eq!(analyze_db_path(audio), anlz, "{audio}");
+        }
+        assert_ne!(
+            analyze_db_path("/Contents/A/Track.flac"),
+            analyze_db_path("/Contents/A/Track.mp3")
+        );
+    }
+
+    #[test]
+    fn relocate_moves_anlz_and_rewrites_ppath() {
+        let root = std::env::temp_dir().join(format!(
+            "drokerbox-anlz-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("P024").join("00006070");
+        let dest = root.join("P036").join("0002F34C");
+        std::fs::create_dir_all(&src).unwrap();
+        let audio = "/Contents/Zorrovian/BIOS/Zorrovian - BIOS.flac";
+        let dat = sample_anlz(audio);
+        std::fs::write(src.join("ANLZ0000.DAT"), &dat).unwrap();
+        std::fs::write(src.join("ANLZ0000.EXT"), &dat).unwrap();
+
+        assert_eq!(relocate_anlz_dir(&src, &dest).unwrap(), 2);
+        assert!(!src.exists());
+        let mp3 = "/Contents/Zorrovian/BIOS/Zorrovian - BIOS.mp3";
+        assert_eq!(rewrite_dir_ppath(&dest, mp3).unwrap(), 2);
+        let rewritten = std::fs::read(dest.join("ANLZ0000.DAT")).unwrap();
+        assert_eq!(parse_ppath(&rewritten).as_deref(), Some(mp3));
+        assert!(dest.join("ANLZ0000.EXT").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

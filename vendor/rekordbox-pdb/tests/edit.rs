@@ -240,6 +240,36 @@ fn bulk_tracks_spill_to_new_pages() {
 }
 
 #[test]
+fn update_track_audio_rewrites_path_and_analyze_path() {
+    let mut ed = PdbEditor::from_file(ONE_SONG).unwrap();
+    ed.update_track_audio(
+        1,
+        "/Contents/A/x.mp3",
+        "x.mp3",
+        320,
+        1_000_000,
+        "/PIONEER/USBANLZ/P036/0002F34C/ANLZ0000.DAT",
+        Some(44100),
+        Some(16),
+    )
+    .unwrap();
+    let db = Database::from_bytes(ed.to_bytes()).unwrap();
+    let t = db.tracks.iter().find(|t| t.id == 1).unwrap();
+    assert_eq!(t.file_path(), "/Contents/A/x.mp3");
+    assert_eq!(t.filename(), "x.mp3");
+    assert_eq!(
+        t.analyze_path(),
+        "/PIONEER/USBANLZ/P036/0002F34C/ANLZ0000.DAT"
+    );
+    assert_eq!(t.bitrate, 320);
+    assert_eq!(t.file_size, 1_000_000);
+    assert_eq!(t.sample_rate, 44100);
+    assert_eq!(t.sample_depth, 16);
+    assert_eq!(t.title(), "Super Smash Bros.");
+    assert_eq!(t.analyze_date(), "2024-02-29");
+}
+
+#[test]
 fn playlist_with_hundreds_of_entries() {
     let mut ed = PdbEditor::from_file(BIGGER).unwrap();
     let pid = ed
