@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -217,6 +217,11 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsMsg, setSettingsMsg] = useState("");
+  const [confirmInPlace, setConfirmInPlace] = useState<{
+    scopeLabel: string;
+    root: string;
+  } | null>(null);
+  const confirmDefaultRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => setAppVersion("?"));
@@ -381,6 +386,19 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!confirmInPlace) return;
+    confirmDefaultRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setConfirmInPlace(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [confirmInPlace]);
+
   const selected = drives.find((d) => d.root === selectedRoot);
   const converting = convertState.state === "running";
   const staging = pipelineState.state === "running";
@@ -474,21 +492,9 @@ export default function App() {
     }
   };
 
-  const startInPlace = async () => {
+  const runInPlace = async () => {
     if (!selectedRoot) return;
-    if (!settings.dryRun) {
-      const scopeLabel =
-        playlistSelect === PLAYLIST_ALL
-          ? "ALL non-MP3 audio on this USB"
-          : `playlist (${scope?.playlistName ?? "selected"})`;
-      const ok = window.confirm(
-        `Convert ${scopeLabel} in place on ${selectedRoot}?\n\n` +
-          "Rewrites the USB database and replaces sources with MP3s.\n" +
-          "Failure before source delete rolls the DB back.",
-      );
-      if (!ok) return;
-    }
-
+    setConfirmInPlace(null);
     setInplaceState({ state: "running", progress: null });
     const playlistId =
       playlistSelect === PLAYLIST_ALL ? null : Number(playlistSelect);
@@ -514,6 +520,19 @@ export default function App() {
     } catch (err) {
       setInplaceState({ state: "error", message: String(err) });
     }
+  };
+
+  const startInPlace = () => {
+    if (!selectedRoot) return;
+    if (!settings.dryRun) {
+      const scopeLabel =
+        playlistSelect === PLAYLIST_ALL
+          ? "ALL non-MP3 audio on this USB"
+          : `playlist (${scope?.playlistName ?? "selected"})`;
+      setConfirmInPlace({ scopeLabel, root: selectedRoot });
+      return;
+    }
+    void runInPlace();
   };
 
   const loadInspect = async () => {
@@ -931,6 +950,57 @@ export default function App() {
         <p className="status-bar-field">{statusLine}</p>
         <p className="status-bar-field">v{appVersion}</p>
       </div>
+
+      {confirmInPlace && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setConfirmInPlace(null)}
+        >
+          <div
+            className="window modal-window"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirm-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="title-bar">
+              <div className="title-bar-text" id="confirm-title">
+                Confirm
+              </div>
+              <div className="title-bar-controls">
+                <button
+                  type="button"
+                  aria-label="Close"
+                  onClick={() => setConfirmInPlace(null)}
+                />
+              </div>
+            </div>
+            <div className="window-body">
+              <p>
+                Convert {confirmInPlace.scopeLabel} in place on{" "}
+                {confirmInPlace.root}?
+              </p>
+              <p>
+                Rewrites the USB database and replaces sources with MP3s.
+                Failure before source delete rolls the DB back.
+              </p>
+              <div className="button-row">
+                <button type="button" onClick={() => setConfirmInPlace(null)}>
+                  Cancel
+                </button>
+                <button
+                  ref={confirmDefaultRef}
+                  type="button"
+                  className="default"
+                  onClick={() => void runInPlace()}
+                >
+                  Convert USB
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

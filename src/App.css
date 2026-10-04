@@ -157,3 +157,23 @@ fieldset {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 10;
+}
+
+.modal-window {
+  width: min(360px, calc(100% - 24px));
+}
+
+.modal-window .window-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
