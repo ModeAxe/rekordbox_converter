@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "rbusb-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "binrw",
  "cc",
@@ -2530,7 +2530,7 @@ version = "0.1.0"
 
 [[package]]
 name = "rekordbox-usb-converter"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rbusb-core",
  "serde",
